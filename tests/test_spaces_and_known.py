@@ -132,6 +132,43 @@ class TestKnownSuppression:
         # flush, so the entry must not cover it.
         assert not under(Finding("ulp", "exp", "float64", "d", (-800.0,), "g", "w"))
 
+    def test_numpy_is_not_a_sign_aware_oracle_in_float16(self):
+        """The fact the float16 min/max entry rests on.
+
+        NumPy's float16 loop returns the first argument for a pair of zeros,
+        while its float32 and float64 loops return the negative zero. So a
+        library that is right by IEEE 754 disagrees with NumPy in float16 only,
+        and `numpy-semantics` has to attribute that to the oracle rather than to
+        the library. If NumPy ever fixes this, this test fails and the entry
+        should be deleted rather than kept as a permanent excuse.
+        """
+        for op in (np.minimum, np.maximum):
+            for wide in (np.float32, np.float64):
+                assert np.signbit(op(wide(0.0), wide(-0.0))) == np.signbit(
+                    op(wide(-0.0), wide(0.0))
+                ), f"{op.__name__} in {wide.__name__} should be order independent"
+            first = op(np.float16(0.0), np.float16(-0.0))
+            second = op(np.float16(-0.0), np.float16(0.0))
+            assert np.signbit(first) != np.signbit(second), (
+                f"np.{op.__name__} in float16 is order independent now, so the "
+                "float16 known entry is obsolete"
+            )
+
+    def test_the_float16_entry_does_not_swallow_the_wider_dtypes(self):
+        """Narrowing the oracle entry must not also narrow the real bug.
+
+        #193781 is a genuine library bug in every float dtype on the oracle-free
+        axes. Only `numpy-semantics` in float16 is the oracle's fault.
+        """
+        from arraydiff.known import known_for
+
+        entries = known_for("torch")
+        for check in ("layout-invariance", "size-invariance"):
+            f = Finding(check, "minimum", "float16", "d", (0.0, -0.0), "g", "w")
+            new, seen = partition([f], entries)
+            assert len(seen) == 1, f"{check} float16 must still be attributed"
+            assert "193781" in seen[0][1].ref
+
     def test_every_entry_carries_a_reason_and_a_link(self):
         """An unexplained suppression is how a real bug gets buried."""
         from arraydiff.known import KNOWN

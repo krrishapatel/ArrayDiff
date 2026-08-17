@@ -281,7 +281,7 @@ Against torch 2.13.0, CPU and MPS:
     18  device-invariance
 
 122 already accounted for in known.py
-    48  https://github.com/pytorch/pytorch/issues/193781
+    46  https://github.com/pytorch/pytorch/issues/193781
     38  https://pytorch.org/docs/stable/notes/numerical_accuracy.html
     12  https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
     12  https://github.com/pytorch/pytorch/issues/193753
@@ -289,6 +289,7 @@ Against torch 2.13.0, CPU and MPS:
      3  https://github.com/pytorch/pytorch/issues/193755
      3  https://github.com/pytorch/pytorch/issues/187295
      2  https://github.com/pytorch/pytorch/issues/193754
+     2  https://numpy.org/doc/stable/reference/generated/numpy.minimum.html
 ```
 
 The 38 are the Sleef-versus-libm last-bit differences, which torch documents as
@@ -336,11 +337,23 @@ ignores the signs and returns whichever argument the expansion happens to name,
 while the vectorized kernel uses `vminq_f32` and is sign aware. So
 `torch.minimum` on `(-0.0, 0.0)` gives `-0.0` on a contiguous tensor and `0.0`
 through a stride, on the same values. Filed as
-[#193781](https://github.com/pytorch/pytorch/issues/193781), and it is the 48
+[#193781](https://github.com/pytorch/pytorch/issues/193781) and fixed in
+[#193851](https://github.com/pytorch/pytorch/pull/193851), and it is the 46
 entries above, spread over `layout-invariance`, `size-invariance` and
 `numpy-semantics` because all three axes can see it. MLX has the same bug from the
 same cause in its own scalar path, above; it was invisible to this tool in both
 libraries until the operand pairing was fixed.
+
+Writing the test for that fix turned up the last two entries, and they are the
+more interesting pair, because the oracle is what is wrong. **NumPy's `minimum`
+and `maximum` are not sign aware in float16.** The float16 loop returns the first
+argument, so `np.minimum(float16(0.0), float16(-0.0))` is `0.0` while the float32
+and float64 loops both give `-0.0`. IEEE 754, `std::fmin` and `vminq_f32` all
+agree with the wider loops, so a library that returns `-0.0` in float16 is correct
+and the disagreement belongs to NumPy. `numpy-semantics` therefore scopes the
+`#193781` attribution to the dtypes where NumPy can be trusted on this, and
+float16 gets its own entry pointing at NumPy. Getting that split wrong is how a
+tool starts filing an oracle's bug against the library under test.
 
 **`fmod` and `remainder` return NaN where the scalar path returns the right
 answer.** `Sleef_fmod` is documented as undefined once `abs(a / b)` reaches

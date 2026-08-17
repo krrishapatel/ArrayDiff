@@ -21,6 +21,12 @@ import numpy as np
 FLOATS = ("float16", "float32", "float64", "bfloat16")
 INTS = ("int8", "int16", "int32", "int64", "uint8", "uint32")
 
+# The dtypes where NumPy's own min/max are sign-aware on zeros, so a disagreement
+# with them is the library's rather than the oracle's. Its float16 loop returns
+# the first argument instead. bfloat16 belongs here because it has no NumPy dtype
+# and its reference is computed in float32.
+NUMPY_SIGN_AWARE_FLOATS = ("float32", "float64", "bfloat16")
+
 
 @dataclass(frozen=True)
 class Known:
@@ -321,18 +327,37 @@ TORCH_KNOWN = [
         Known(
             check=check,
             op=("minimum", "maximum"),
-            dtype=FLOATS,
+            dtype=FLOATS if check != "numpy-semantics" else NUMPY_SIGN_AWARE_FLOATS,
             reason=(
                 "A zero result gets a sign that depends on which kernel ran. The "
                 "scalar path is std::min, which returns b < a ? b : a and so "
                 "ignores the sign of a zero, and the NEON path is vminq_f32, "
                 "which is sign-aware. minimum(0.0, -0.0) is therefore -0.0 in a "
-                "long tensor and 0.0 in a short one. Filed as #193781."
+                "long tensor and 0.0 in a short one. Filed as #193781, fixed in "
+                "PR #193851."
             ),
             ref="https://github.com/pytorch/pytorch/issues/193781",
         )
         for check in ("layout-invariance", "size-invariance", "numpy-semantics")
     ],
+    # The oracle is the thing that is wrong here, which is why this is a separate
+    # entry from #193781 rather than more dtypes on it.
+    Known(
+        check="numpy-semantics",
+        op=("minimum", "maximum"),
+        dtype=("float16",),
+        reason=(
+            "NumPy is not a valid oracle for a signed zero in float16. Its "
+            "float16 loop returns the first argument rather than the negative "
+            "zero, so np.minimum(float16(0.0), float16(-0.0)) is 0.0 while the "
+            "float32 and float64 loops both give -0.0. IEEE 754 minimum and "
+            "maximum, std::fmin/std::fmax and vminq_f32 all agree with the wider "
+            "loops, so a library that gives -0.0 in float16 is right and the "
+            "disagreement is NumPy's. Only float16: bfloat16 has no NumPy dtype "
+            "here, so its reference is computed in float32, which is sign-aware."
+        ),
+        ref="https://numpy.org/doc/stable/reference/generated/numpy.minimum.html",
+    ),
     Known(
         check="device-invariance",
         op="abs",
