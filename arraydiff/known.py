@@ -306,9 +306,120 @@ TORCH_KNOWN = [
 ]
 
 
+# XLA on CPU treats subnormals as zero in arithmetic. Storage keeps them, so a
+# subnormal survives a round trip and only changes when it is operated on, which
+# is why this shows up as a NumPy mismatch rather than a bad input. Ruled expected
+# twice and documented, so it is one entry reused rather than nine findings.
+_JAX_DAZ = (
+    "XLA flushes subnormals to zero in arithmetic on CPU. 1 / DBL_MAX gives "
+    "0.0 and a subnormal operand multiplies as if it were zero. Closed as "
+    "expected on #37670 and #37761, and documented in Sharp Bits."
+)
+_JAX_DAZ_REF = (
+    "https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html"
+    "#double-64bit-precision"
+)
+
+JAX_KNOWN = [
+    Known(
+        check="numpy-semantics",
+        op=(
+            "add", "subtract", "multiply", "divide",
+            "minimum", "maximum", "floor", "ceil", "reciprocal",
+        ),
+        dtype=FLOATS,
+        reason=_JAX_DAZ,
+        ref=_JAX_DAZ_REF,
+    ),
+    Known(
+        check="ulp",
+        op="reciprocal",
+        dtype=FLOATS,
+        reason=(
+            _JAX_DAZ + " Here the flush is on the output: the true reciprocal of "
+            "a near-max input is subnormal, so it comes back as 0.0."
+        ),
+        ref=_JAX_DAZ_REF,
+    ),
+    Known(
+        check="divmod-identity",
+        op="divmod",
+        dtype=FLOATS,
+        reason=(
+            _JAX_DAZ + " A subnormal divisor acts as zero, so the quotient is "
+            "inf and q*b + r cannot recover the dividend."
+        ),
+        ref=_JAX_DAZ_REF,
+    ),
+    Known(
+        check="size-invariance",
+        op=("exp", "log", "arctan"),
+        dtype=FLOATS,
+        reason=(
+            "Every jnp op is jit-decorated, so each shape is a separate XLA "
+            "compilation and can pick a different vector width. The results "
+            "differ by a ULP. JAX documents that jit changes the exact numerics "
+            "of outputs, so length dependence is expected here in a way it is "
+            "not in an eager library."
+        ),
+        ref="https://docs.jax.dev/en/latest/faq.html",
+    ),
+    Known(
+        check="ulp",
+        op="sinh",
+        dtype=FLOATS,
+        reason=(
+            "About 4 ULP at small arguments, where NumPy is under 1. sinh is "
+            "(exp(x) - exp(-x)) / 2, so XLA's exp error shows through. Not "
+            "filed: JAX's own test tolerance is 1e-6 relative for float32 and "
+            "1e-15 for float64 (_default_tolerance in public_test_util.py), and "
+            "4 ULP is 4.8e-7, inside both. Worth reporting only if it grows."
+        ),
+        ref="https://github.com/jax-ml/jax/blob/main/jax/_src/public_test_util.py",
+    ),
+    Known(
+        check="numpy-semantics",
+        op="sign",
+        dtype=FLOATS,
+        reason=(
+            "sign(-0.0) returns -0.0 where NumPy returns 0.0. The documented "
+            "value for a zero input is 0, and -0.0 == 0, so this meets the "
+            "contract. Recorded rather than filed."
+        ),
+        ref="https://docs.jax.dev/en/latest/_autosummary/jax.numpy.sign.html",
+    ),
+    Known(
+        check="numpy-semantics",
+        op="remainder",
+        dtype=FLOATS,
+        reason=(
+            "A zero remainder keeps the sign of the dividend, but the docstring "
+            "says the result has the sign of the divisor. The sign fixup in "
+            "remainder is guarded on the remainder being nonzero, so lax.rem's "
+            "sign survives. Filed as #40028."
+        ),
+        ref="https://github.com/jax-ml/jax/issues/40028",
+    ),
+    Known(
+        check="numpy-semantics",
+        op="floor_divide",
+        dtype=FLOATS,
+        reason=(
+            "A zero quotient gets the sign of the divisor alone, not of a / b, "
+            "so -0.0 // 3.0 is 0.0 where Python and NumPy give -0.0. "
+            "_float_divmod computes x1 - mod first, and for a negative zero "
+            "dividend that is -0.0 - -0.0, which is +0.0. Reported on the "
+            "#40028 thread, since the fix is in the same file as the remainder "
+            "sign. Some elements in this finding are the DAZ flush instead."
+        ),
+        ref="https://github.com/jax-ml/jax/issues/40028",
+    ),
+]
+
+
 # Each library gets its own list. A shared list would let an MLX ruling suppress
 # a real torch bug that happens to be the same op and dtype.
-KNOWN = {"mlx": MLX_KNOWN, "torch": TORCH_KNOWN}
+KNOWN = {"mlx": MLX_KNOWN, "torch": TORCH_KNOWN, "jax": JAX_KNOWN}
 
 
 def known_for(backend_name):

@@ -7,25 +7,31 @@ import sys
 from collections import Counter
 
 
-def _load_backend(name):
-    from .backends import mlx_backend, torch_backend
+# Module to import, then the adapter to hand it to. A table rather than a chain
+# of ifs, so adding a library is one line here and one in backends.py.
+BACKENDS = {
+    "mlx": ("mlx.core", "mlx_backend"),
+    "torch": ("torch", "torch_backend"),
+    "jax": ("jax", "jax_backend"),
+    "numpy": ("numpy", None),
+}
 
-    if name == "mlx":
-        try:
-            import mlx.core as mx
-        except ImportError:
-            print(
-                "mlx is not importable; set PYTHONPATH to an mlx build",
-                file=sys.stderr,
-            )
-            return None
-        return mlx_backend(mx)
+
+def _load_backend(name):
+    from importlib import import_module
+
+    from . import backends
+
+    module, adapter = BACKENDS[name]
+    if adapter is None:
+        return backends.numpy_backend()
     try:
-        import torch
+        lib = import_module(module)
     except ImportError:
-        print("torch is not importable", file=sys.stderr)
+        hint = "; set PYTHONPATH to an mlx build" if name == "mlx" else ""
+        print(f"{module} is not importable{hint}", file=sys.stderr)
         return None
-    return torch_backend(torch)
+    return getattr(backends, adapter)(lib)
 
 
 def main(argv=None):
@@ -45,7 +51,10 @@ def main(argv=None):
         help="also print divergences that known.py already accounts for",
     )
     ap.add_argument(
-        "--backend", default="mlx", choices=("mlx", "torch"), help="library to test"
+        "--backend",
+        default="mlx",
+        choices=tuple(BACKENDS),
+        help="library to test",
     )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)

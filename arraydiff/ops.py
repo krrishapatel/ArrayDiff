@@ -12,6 +12,7 @@ that a NaN-vs-NaN comparison does not stand in for a real check.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Callable
 
 import numpy as np
@@ -135,3 +136,21 @@ def build_ops(mx):
 
 def build_torch_ops(torch):
     return _build(torch, TORCH_NAMES)
+
+
+def build_jax_ops(jax):
+    """jnp uses NumPy's spelling for almost everything.
+
+    rsqrt and erf are the two exceptions and live elsewhere in JAX, so they are
+    pulled in by hand. Letting them fall through as missing would quietly test
+    JAX on a smaller op set than the other libraries.
+    """
+    import jax.numpy as jnp
+    import jax.scipy.special as jsp
+
+    ns = SimpleNamespace(
+        **{s.name: getattr(jnp, s.name) for s in SPECS if hasattr(jnp, s.name)}
+    )
+    ns.rsqrt = jax.lax.rsqrt
+    ns.erf = jsp.erf
+    return _build(ns, {})

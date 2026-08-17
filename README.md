@@ -109,11 +109,12 @@ differ" and pointed at the wrong input.
 ```bash
 pip install -e '.[dev]'
 
-# neither library is a dependency; point at whatever build you want to test
+# no library under test is a dependency; point at whatever build you want
 PYTHONPATH=/path/to/mlx/python arraydiff
 PYTHONPATH=/path/to/mlx/python arraydiff --only tan power --check layout-invariance
 
 arraydiff --backend torch
+arraydiff --backend jax
 ```
 
 Exit status is 1 when there are findings, so it can gate CI.
@@ -130,8 +131,8 @@ new, already_known = partition(run(be), known_for(be.name))
 
 ## Status
 
-Two libraries. Both come back clean, which is the goal state rather than an empty
-run: everything either check finds is fixed, filed, or ruled on.
+Three libraries. All three come back clean, which is the goal state rather than an
+empty run: everything either check finds is fixed, filed, or ruled on.
 
 ### MLX
 
@@ -241,6 +242,55 @@ never corrected. Filed as
 [#193755](https://github.com/pytorch/pytorch/issues/193755). This is the same bug
 class as MLX's [#4315](https://github.com/ml-explore/mlx/issues/4315) above,
 found independently in a second library by the same check.
+
+### JAX
+
+Against jax 0.11.0 on CPU:
+
+```
+0 new findings
+
+38 already accounted for in known.py
+    22  https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html
+     6  https://docs.jax.dev/en/latest/faq.html
+     6  https://github.com/jax-ml/jax/issues/40028
+     3  https://docs.jax.dev/en/latest/_autosummary/jax.numpy.sign.html
+     1  https://github.com/jax-ml/jax/blob/main/jax/_src/public_test_util.py
+```
+
+JAX has no layout axis to test. XLA materializes every view, so a strided input
+reaches the kernel as a fresh contiguous buffer and the check would be comparing a
+copy against itself. Its adapter declares only `contiguous`, which makes
+`layout-invariance` skip rather than pass for free. Length still picks the kernel,
+so `size-invariance` still applies, but for a different reason than elsewhere:
+every `jnp` op is `jit` decorated, so each shape is a separate XLA compilation, and
+JAX documents that `jit` changes the exact numerics of outputs. Those 6 are that.
+
+The 22 are one root cause. XLA flushes subnormals to zero in arithmetic on CPU, so
+`1 / DBL_MAX` is `0.0` and a subnormal operand multiplies as if it were zero.
+Storage keeps subnormals, which is why this shows up as a NumPy mismatch on
+ordinary inputs rather than as a bad input. Closed as expected twice and documented
+in Sharp Bits.
+
+One bug was filed out of this run.
+
+**`remainder` gives a zero result the sign of the dividend, not the divisor.**
+`jnp.remainder` documents that the result has the sign of `x2`, and all four of
+`jnp.remainder([-1, -4, 0, 4], [1, 2, -3, -2])` disagree with that, with NumPy, and
+with Python's `%`. `jnp.fmod` is right on the same inputs, which localizes it to the
+floored fixup: it is guarded on the remainder being nonzero, so `lax.rem`'s sign
+survives. Filed as [#40028](https://github.com/jax-ml/jax/issues/40028).
+
+`floor_divide` is a sibling in the same file and is on that thread rather than a
+second issue. A zero quotient gets the sign of the divisor alone, so `-0.0 // 3.0`
+is `0.0` where Python and NumPy give `-0.0`. `_float_divmod` computes `x1 - mod`
+before dividing, and for a negative zero dividend that is `-0.0 - -0.0`, which is
+`+0.0`, so the sign is gone before the division happens.
+
+The zero remainder sign is now the third independent instance of one bug class
+found by one check, after MLX and torch. That is the argument for a differential
+tester over a per library test suite: the bug is in the shape of the algorithm, not
+in any one codebase.
 
 ### NumPy
 

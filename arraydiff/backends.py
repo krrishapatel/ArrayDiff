@@ -99,6 +99,52 @@ def mlx_backend(mx) -> Backend:
     )
 
 
+def jax_backend(jax) -> Backend:
+    """JAX.
+
+    Layout invariance does not apply here, and saying so is the point. XLA
+    materializes every view, so a strided input reaches the kernel as a fresh
+    contiguous buffer and the check would be comparing a copy against itself.
+    Only `contiguous` is declared, which makes the check skip rather than pass
+    for free. Length still selects the kernel, so size invariance does apply.
+    """
+    import jax.numpy as jnp
+
+    from .ops import build_jax_ops
+
+    # float64 is opt-in in JAX. Without this a float64 request silently gets
+    # float32, so every float64 finding would be mislabelled.
+    jax.config.update("jax_enable_x64", True)
+
+    dtypes = {
+        n: getattr(jnp, n)
+        for n in (
+            "float16", "float32", "float64", "bfloat16",
+            "int8", "int16", "int32", "int64", "uint8", "uint32",
+        )
+        if hasattr(jnp, n)
+    }
+
+    def to_numpy(a):
+        if a.dtype == jnp.bfloat16:
+            a = a.astype(jnp.float32)
+        return np.asarray(a)
+
+    return Backend(
+        name="jax",
+        dtypes=dtypes,
+        array=lambda v, dtype=None: jnp.array(v, dtype=dtype),
+        to_numpy=to_numpy,
+        broadcast_to=jnp.broadcast_to,
+        ops=build_jax_ops(jax),
+        divmod=jnp.divmod,
+        # JAX dispatches asynchronously, so without this a check could compare
+        # results that have not been computed yet.
+        evaluate=lambda *xs: jax.block_until_ready(list(xs)),
+        layouts=("contiguous",),
+    )
+
+
 def torch_backend(torch) -> Backend:
     from .ops import build_torch_ops
 
