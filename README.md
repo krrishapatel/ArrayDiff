@@ -174,12 +174,12 @@ new, already_known = partition(run(be), known_for(be.name))
 Three libraries. `known.py` accounts for everything already settled, so the new
 count below is only the part that is not, and every line of it is attributed to a
 cause before it is called a finding. Nothing new is being filed at the moment.
-The threads already open across these projects are waiting on maintainers, and a
-seventh one does not make the first six get read.
+Everything already open across these projects is waiting on a maintainer, and
+adding to that pile is not what makes any of it get read.
 
 ### MLX
 
-Against MLX main at `855b4da`:
+Against MLX main at `c2bcf47`, with the pending `remainder` fix below applied:
 
 ```
 42 new findings
@@ -238,10 +238,11 @@ reduces to a self contradiction: lane 8 of
 `mx.remainder(mx.full((9,), -0.0), mx.full((9,), 3.0))` disagrees with lanes 0 to
 7 on identical inputs, because the Accelerate SIMD body and the scalar residual
 produce zeros of different signs and the floored fixup skips zero. Filed as
-[#4315](https://github.com/ml-explore/mlx/issues/4315) and fixed across all four
-backends in [#4316](https://github.com/ml-explore/mlx/pull/4316). The numbers
-above are measured against a build that has the fix, which is why it has no entry
-in the list.
+[#4315](https://github.com/ml-explore/mlx/issues/4315), with a fix across all
+four backends proposed in
+[#4316](https://github.com/ml-explore/mlx/pull/4316), still open. The numbers
+above are measured with that patch applied, which is why it has no entry in the
+list.
 
 **`floor_divide` disagrees with both NumPy and Python at infinity.** `inf // -3.0`
 gives `-inf` where both references give `nan`, and `1.0 // -inf` gives `-0.0`
