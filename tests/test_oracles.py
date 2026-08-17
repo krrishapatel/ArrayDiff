@@ -152,3 +152,55 @@ class TestBitwiseEqual:
         assert bitwise_equal(np.array([1 + 2j]), np.array([1 + 2j]))
         assert not bitwise_equal(np.array([complex(0.0, 1.0)]),
                                  np.array([complex(-0.0, 1.0)]))
+
+
+class TestCategoricalDiff:
+    """The looser definition used on the device axis, where bit equality is not
+    the contract but a difference in kind still is.
+
+    Every case here is a subset of bitwise_diff: categorical_diff may never
+    report something bitwise_diff does not.
+    """
+
+    def _only(self, a, b):
+        from arraydiff.oracles import bitwise_diff, categorical_diff
+
+        cat, bit = categorical_diff(np.array(a), np.array(b)), bitwise_diff(
+            np.array(a), np.array(b)
+        )
+        assert not (cat & ~bit).any(), "categorical is not a subset of bitwise"
+        return cat.tolist()
+
+    def test_rounding_is_not_categorical(self):
+        """The whole reason this function exists. Two devices are allowed to
+        differ in the last bit of a transcendental, so a 1-ULP disagreement must
+        not be reported."""
+        a = np.array([0.8337300251311491, 1e-30, 700.0])
+        b = np.array([0.8337300251311493, 1.0000001e-30, 700.0000000000001])
+        assert self._only(a, b) == [False, False, False]
+
+    def test_nan_against_a_number(self):
+        assert self._only([np.nan, 1.0], [1.0, 1.0]) == [True, False]
+
+    def test_infinity_against_a_finite_value(self):
+        """A huge-but-finite result is not an infinity, however large it is."""
+        assert self._only([np.inf], [1e308]) == [True]
+
+    def test_infinity_sign(self):
+        assert self._only([np.inf], [-np.inf]) == [True]
+
+    def test_zero_sign(self):
+        assert self._only([0.0, -0.0], [-0.0, -0.0]) == [True, False]
+
+    def test_exact_zero_against_something_nonzero(self):
+        """erf on arm64 returns exactly 0.0 for tiny inputs where the correct
+        answer is a small nonzero number. Underflowing all the way to zero is a
+        change in kind, not a rounding difference, however small the value."""
+        assert self._only([0.0], [1.3264033e-38]) == [True]
+
+    def test_integers_have_no_accuracy_axis(self):
+        """Nothing about an integer result is approximate, so every difference
+        counts. Rounding a float64 detour through int64 is the bug this guards."""
+        a = np.array([2**62 + 1, 5], dtype=np.int64)
+        b = np.array([2**62 + 2, 5], dtype=np.int64)
+        assert self._only(a, b) == [True, False]

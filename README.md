@@ -33,8 +33,38 @@ version checked only unary ops, which silently skipped `power`.
 check because length is what picks the kernel: a long array goes through the
 vectorized body and a short one goes through the scalar path, which is usually a
 different algorithm rather than the same one unrolled. Layout invariance cannot
-see this, since every layout it builds is full length. This is the check that
-found the three torch bugs below.
+see this, since every layout it builds is full length. It is the check that found
+most of the torch bugs below.
+
+`device-invariance` is the third axis, and it is the strongest of the three,
+because a second device is not a second code path through one algorithm but a
+separate implementation: the CPU and GPU kernels for an op are written by
+different people, often years apart, and the special cases are where they drift.
+
+The bar there cannot be bit equality, and getting that right is the whole check.
+Nobody promises that a Metal `exp` matches an Accelerate `exp` in the last bit,
+and torch documents as much, so demanding it would bury every real finding under
+a wall of rounding. Ops that are correctly rounded or integral are still held to
+bit equality, since IEEE 754 or the op's own definition pins their result on any
+device. For the rest only a difference in *kind* counts, which is
+`categorical_diff`: a NaN against a number, an infinity against a finite value,
+an infinity or a zero with the other sign, or an exact zero where the other
+device returned something nonzero. None of those can be a rounding difference,
+in any precision, so they are findings wherever they appear.
+
+That split is what makes the axis usable. Held to bit equality, torch reports on
+most of the op table; held to differences in kind, it reports 18 findings with
+five causes.
+
+**A binary op has to be tried against the combinations, not the values.** The
+second operand used to be a rotation of the first, which only ever produces the
+pairings that the rotation happens to make. With a shift of 3, `0.0` never lines
+up with `-0.0`, so no number of random draws could have found a `minimum` that
+returns the wrong zero. Every special value is now tried against every other,
+which is 225 pairs and costs nothing. That single change is what surfaced torch
+[#193781](https://github.com/pytorch/pytorch/issues/193781) and the 42 MLX
+findings below, both of which had been sitting under the previous generator the
+whole time.
 
 **The budget has to be one a working implementation passes.** Two things go wrong
 here. A flat budget ignores conditioning: `exp` has relative condition number
@@ -75,12 +105,22 @@ intentional divergence lives in `known.py` with a reason and a link, and
 [declined deliberately](https://github.com/ml-explore/mlx/issues/3644) because
 torch does the same and propagating costs instructions on the hot path.
 
+An entry can also carry a `when` predicate, so that a cause which only applies to
+part of an op's input range suppresses only that part. XLA flushing subnormals
+makes `jnp.exp(-715.4)` return `0.0` instead of `2.1e-311`, which the accuracy
+check sees as an error of 4e12 ULP. Suppressing that by op and dtype alone would
+hide every other accuracy bug in `exp`, so the entry is restricted to inputs
+whose exact result is genuinely subnormal, a band about 37 wide out of the whole
+line. Below it, returning `0.0` is correct rather than a flush, and the measured
+error is already zero.
+
 ## Checks
 
 | check | needs an oracle | what it means |
 |---|---|---|
 | `layout-invariance` | no | same values, different memory layout, different result |
 | `size-invariance` | no | same values, shorter array, different result |
+| `device-invariance` | no | same values, another device, a difference rounding cannot explain |
 | `divmod-identity` | no | `q*b + r == a` fails |
 | `divmod-vs-floor_divide` | no | `divmod`'s quotient disagrees with `floor_divide` |
 | `numpy-semantics` | NumPy | bit-exact disagreement on an op that should be exact |
@@ -131,15 +171,21 @@ new, already_known = partition(run(be), known_for(be.name))
 
 ## Status
 
-Three libraries. All three come back clean, which is the goal state rather than an
-empty run: everything either check finds is fixed, filed, or ruled on.
+Three libraries. `known.py` accounts for everything already settled, so the new
+count below is only the part that is not, and every line of it is attributed to a
+cause before it is called a finding. Nothing new is being filed at the moment.
+The threads already open across these projects are waiting on maintainers, and a
+seventh one does not make the first six get read.
 
 ### MLX
 
-Against MLX main at `c2bcf47` plus the pending `remainder` fix below:
+Against MLX main at `855b4da`:
 
 ```
-0 new findings
+42 new findings
+    24  layout-invariance
+    16  size-invariance
+     2  numpy-semantics
 
 228 already accounted for in known.py
    196  https://github.com/ml-explore/mlx/issues/4163
@@ -154,7 +200,37 @@ Against MLX main at `c2bcf47` plus the pending `remainder` fix below:
 The 228 are the main evidence that the checks work: the tool rediscovers the
 whole known numerical bug cluster without being told about any of it.
 
-Two bugs were filed out of running this, and one rediscovery is recorded.
+All 42 new findings are one bug, and the special-value pairing change above is
+what surfaced it. It had been reachable the whole time and nothing reached it.
+
+**`minimum` and `maximum` give a zero result a sign that depends on the array's
+length.** There are two implementations. The vectorized one calls Accelerate's
+`simd::min`, which compiles to `vminq_f32` and is sign aware. The scalar one, in
+`base_simd.h`, is `return (a < b) ? a : b`, and `-0.0 < 0.0` is false, so it
+returns whichever operand came second no matter what the signs were. Which one
+runs is decided by how many elements are left.
+
+That makes it visible with no oracle, as a single array contradicting itself:
+
+```
+mx.minimum(mx.full((n,), -0.0), mx.full((n,), 0.0))
+
+n = 7    every lane  0.0     scalar throughout, all wrong
+n = 8    every lane -0.0     one full register, all right
+n = 9    lanes 0-7  -0.0     the vectorized body
+         lane 8      0.0     the scalar residual, same inputs, other answer
+```
+
+NumPy and Python both give `-0.0`. `maximum` is the mirror image, `(a > b) ? a : b`,
+so `mx.maximum(0.0, -0.0)` is `-0.0` where it should be `0.0`.
+
+This is the same shape as the `remainder` bug below, which is the argument for
+`layout-invariance` and `size-invariance` being separate checks rather than one:
+a residual lane disagreeing with the lanes beside it needs no reference to be
+wrong. Recorded here rather than filed. It only moves a zero's sign, and it is
+queued behind threads in these projects that are still unanswered.
+
+Two bugs were filed out of earlier runs, and one rediscovery is recorded.
 
 **`remainder` gives a zero result a path dependent sign.** Found by
 `layout-invariance` with no oracle at all, which is what that check is for. It
@@ -163,8 +239,9 @@ reduces to a self contradiction: lane 8 of
 7 on identical inputs, because the Accelerate SIMD body and the scalar residual
 produce zeros of different signs and the floored fixup skips zero. Filed as
 [#4315](https://github.com/ml-explore/mlx/issues/4315) and fixed across all four
-backends in [#4316](https://github.com/ml-explore/mlx/pull/4316); the sweep
-against that build is what the numbers above are measured on.
+backends in [#4316](https://github.com/ml-explore/mlx/pull/4316). The numbers
+above are measured against a build that has the fix, which is why it has no entry
+in the list.
 
 **`floor_divide` disagrees with both NumPy and Python at infinity.** `inf // -3.0`
 gives `-inf` where both references give `nan`, and `1.0 // -inf` gives `-0.0`
@@ -196,22 +273,73 @@ comes back `4` instead of `-5`.
 
 ### PyTorch
 
-Against torch 2.13.0 on CPU:
+Against torch 2.13.0, CPU and MPS:
 
 ```
-0 new findings
+18 new findings
+    18  device-invariance
 
-52 already accounted for in known.py
-    32  https://pytorch.org/docs/stable/notes/numerical_accuracy.html
+122 already accounted for in known.py
+    48  https://github.com/pytorch/pytorch/issues/193781
+    38  https://pytorch.org/docs/stable/notes/numerical_accuracy.html
+    12  https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
     12  https://github.com/pytorch/pytorch/issues/193753
+     4  https://github.com/pytorch/pytorch/pull/190053
      3  https://github.com/pytorch/pytorch/issues/193755
      3  https://github.com/pytorch/pytorch/issues/187295
      2  https://github.com/pytorch/pytorch/issues/193754
 ```
 
-The 32 are the Sleef-versus-libm last-bit differences, which torch documents as
-allowed and which are therefore not findings. The rest are three bugs filed out
-of this run.
+The 38 are the Sleef-versus-libm last-bit differences, which torch documents as
+allowed and which are therefore not findings. The 12 Metal entries are float32
+subnormals: Metal flushes them, the specification says so, and it shows up on 12
+ops at once. float16 and bfloat16 are unaffected because their subnormals start
+far above the threshold. The 4 are integer `abs` on MPS rounding through float32,
+so `abs(int32(-123456789))` came back `123456792`; that one is a rediscovery, and
+the prior-work check is what caught it, since `d0458e4559` had already fixed it
+in main. It reproduces on 2.13.0 only.
+
+The 18 new findings are 6 ops in 3 dtypes each, and five causes:
+
+| op | CPU | MPS |
+|---|---|---|
+| `arctan(-0.0)` | `-0.0` | `0.0` |
+| `erf(1.18e-38)` | `0.0` | `1.33e-38` |
+| `remainder(0.0, inf)` | `0.0` | `nan`, on 75 of 503 elements |
+| `1.0 // -inf` | `-1.0` | `-0.0`, on 38 of 503 elements |
+| `minimum(-0.0, 0.0)` | `-0.0` | `0.0` |
+
+`erf` is the one worth pointing at, because the wrong device is the reference one.
+The arm64 CPU kernel uses the Abramowitz and Stegun 7.1.26 approximation, which
+has a bounded absolute error and no relative guarantee, so for a tiny input it
+returns exactly `0.0` where the answer is a small nonzero number. `erf(x) ~ 2x/sqrt(pi)`
+there, so the result is a normal float and there is nothing to underflow.
+`IMPLEMENT_FLOAT_KERNEL` routes every length through the vector path, so there is
+no scalar fallback to disagree with it and neither oracle-free axis on one device
+can see it. Two devices can. This is the case that `categorical_diff` is written
+for: an exact zero against a nonzero value is not a rounding difference at any
+precision, which is why the check reports it at all instead of measuring the gap
+in ULP and calling it noise.
+
+`floor_divide` at infinity is the same bug as MLX's
+[#4317](https://github.com/ml-explore/mlx/issues/4317), now in a second library,
+and `minimum` on zeros is the MPS kernel repeating the CPU bug in
+[#193781](https://github.com/pytorch/pytorch/issues/193781) in a separate
+codebase. All 18 are held rather than filed, for the reason at the top of Status.
+
+Four bugs were filed out of earlier runs.
+
+**`minimum` and `maximum` give a zero result a sign that depends on the layout and
+the length.** `std::min(a, b)` is specified as `b < a ? b : a`, so on two zeros it
+ignores the signs and returns whichever argument the expansion happens to name,
+while the vectorized kernel uses `vminq_f32` and is sign aware. So
+`torch.minimum` on `(-0.0, 0.0)` gives `-0.0` on a contiguous tensor and `0.0`
+through a stride, on the same values. Filed as
+[#193781](https://github.com/pytorch/pytorch/issues/193781), and it is the 48
+entries above, spread over `layout-invariance`, `size-invariance` and
+`numpy-semantics` because all three axes can see it. MLX has the same bug from the
+same cause in its own scalar path, above; it was invisible to this tool in both
+libraries until the operand pairing was fixed.
 
 **`fmod` and `remainder` return NaN where the scalar path returns the right
 answer.** `Sleef_fmod` is documented as undefined once `abs(a / b)` reaches
@@ -250,13 +378,19 @@ Against jax 0.11.0 on CPU:
 ```
 0 new findings
 
-38 already accounted for in known.py
-    22  https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html
+40 already accounted for in known.py
+    24  https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#double-64bit-precision
      6  https://docs.jax.dev/en/latest/faq.html
      6  https://github.com/jax-ml/jax/issues/40028
      3  https://docs.jax.dev/en/latest/_autosummary/jax.numpy.sign.html
      1  https://github.com/jax-ml/jax/blob/main/jax/_src/public_test_util.py
 ```
+
+JAX is the one that comes back empty, and it stays empty at a larger sample. It
+did not at first: raising `--random` turned up an `exp` accuracy finding, which is
+the subnormal flush described above and is the reason the `when` predicate exists.
+Suppressing `exp` outright would have made this section clean by making the check
+useless.
 
 JAX has no layout axis to test. XLA materializes every view, so a strided input
 reaches the kernel as a fresh contiguous buffer and the check would be comparing a
@@ -266,7 +400,7 @@ so `size-invariance` still applies, but for a different reason than elsewhere:
 every `jnp` op is `jit` decorated, so each shape is a separate XLA compilation, and
 JAX documents that `jit` changes the exact numerics of outputs. Those 6 are that.
 
-The 22 are one root cause. XLA flushes subnormals to zero in arithmetic on CPU, so
+The 24 are one root cause. XLA flushes subnormals to zero in arithmetic on CPU, so
 `1 / DBL_MAX` is `0.0` and a subnormal operand multiplies as if it were zero.
 Storage keeps subnormals, which is why this shows up as a NumPy mismatch on
 ordinary inputs rather than as a bad input. Closed as expected twice and documented

@@ -58,6 +58,26 @@ class TestValueSpaces:
         # subnormals are where flush-to-zero bugs live
         assert (np.abs(vals) < np.finfo(np.float32).smallest_normal).any()
 
+    def test_every_special_pairing_is_actually_tried(self):
+        """The regression guard for a real coverage hole.
+
+        The second operand used to be a rotation of the first, so only the
+        pairings that a shift of 3 happens to produce were ever tested. `0.0`
+        against `-0.0` was not one of them, which is why the sweep did not see
+        torch's #193781 until this existed.
+        """
+        from arraydiff.spaces import SPECIAL_FLOATS, special_pairs
+
+        a, b = special_pairs(np.float32)
+        seen = {
+            (float(x), bool(np.signbit(x)), float(y), bool(np.signbit(y)))
+            for x, y in zip(a, b)
+            if not (np.isnan(x) or np.isnan(y))
+        }
+        assert (0.0, False, 0.0, True) in seen, "0.0 against -0.0 must be tried"
+        assert (0.0, True, 0.0, False) in seen, "and in the other order"
+        assert len(a) == len(b) == len(SPECIAL_FLOATS) ** 2
+
     def test_ints_stay_in_range(self):
         for dtype in (np.int8, np.uint8, np.int32):
             vals = int_values(dtype, rng=np.random.default_rng(0))
@@ -87,10 +107,36 @@ class TestKnownSuppression:
         new, seen = partition([_finding(check="ulp", op="cos", dtype="float64")], known)
         assert len(new) == 1
 
+    def test_a_predicate_narrows_an_entry_to_part_of_the_input_range(self):
+        """`when` exists so that suppressing a documented underflow in exp does
+        not also suppress every other accuracy bug in exp."""
+        known = [
+            Known("ulp", "exp", "reason", "ref", when=lambda f: f.inputs[0] < -708.0)
+        ]
+        new, seen = partition([_finding(check="ulp", op="exp")], known)
+        assert len(new) == 1, "an in-range input is not covered by this entry"
+        deep = Finding("ulp", "exp", "float64", "d", (-720.0,), "got", "want")
+        new, seen = partition([deep], known)
+        assert len(seen) == 1
+
+    def test_the_real_exp_underflow_predicate_is_dtype_aware(self):
+        """float32 subnormals start about 1e-38 and float64 about 1e-308, so the
+        same input is a documented flush in one precision and a real bug in the
+        other."""
+        from arraydiff.known import _exp_underflows_to_subnormal as under
+
+        assert under(Finding("ulp", "exp", "float32", "d", (-95.0,), "g", "w"))
+        assert not under(Finding("ulp", "exp", "float64", "d", (-95.0,), "g", "w"))
+        assert under(Finding("ulp", "exp", "float64", "d", (-715.0,), "g", "w"))
+        # Below the smallest subnormal, returning 0.0 is correct rather than a
+        # flush, so the entry must not cover it.
+        assert not under(Finding("ulp", "exp", "float64", "d", (-800.0,), "g", "w"))
+
     def test_every_entry_carries_a_reason_and_a_link(self):
         """An unexplained suppression is how a real bug gets buried."""
-        from arraydiff.known import MLX_KNOWN
+        from arraydiff.known import KNOWN
 
-        for k in MLX_KNOWN:
-            assert len(k.reason) > 30, k
-            assert k.ref.startswith("https://github.com/"), k
+        for name, entries in KNOWN.items():
+            for k in entries:
+                assert len(k.reason) > 30, (name, k)
+                assert k.ref.startswith("https://"), (name, k)

@@ -36,6 +36,12 @@ class Backend:
     # Layouts this backend can express, or None for all of them. Torch has no
     # negative strides, so a reversed view does not exist there at all.
     layouts: tuple[str, ...] | None = None
+    # Devices to cross-check, most trusted first. Fewer than two means there is
+    # nothing to compare and `device-invariance` skips. MLX has one unified
+    # device, and JAX here is CPU only, so torch is currently the only backend
+    # with a second entry.
+    devices: tuple[str, ...] = ()
+    to_device: Callable | None = None  # (native array, device name) -> array
 
     def dtype(self, name):
         return self.dtypes.get(name)
@@ -146,6 +152,12 @@ def jax_backend(jax) -> Backend:
 
 
 def torch_backend(torch) -> Backend:
+    """Torch, on every device it can reach.
+
+    The device list is what makes `device-invariance` run here. MPS is added only
+    when it is actually available, so the check skips on a machine without it
+    rather than reporting the whole op table as broken.
+    """
     from .ops import build_torch_ops
 
     dtypes = {
@@ -176,6 +188,13 @@ def torch_backend(torch) -> Backend:
             torch.remainder(a, b),
         )
 
+    devices = ["cpu"]
+    if torch.backends.mps.is_available():
+        devices.append("mps")
+
+    def to_device(a, device):
+        return a.to(device)
+
     return Backend(
         name="torch",
         dtypes=dtypes,
@@ -184,6 +203,10 @@ def torch_backend(torch) -> Backend:
         broadcast_to=torch.broadcast_to,
         ops=build_torch_ops(torch),
         divmod=divmod_,
+        devices=tuple(devices),
+        to_device=to_device,
+        # No `evaluate` is needed even for MPS: every check reads its results
+        # through to_numpy, and the .cpu() there synchronizes.
         # Torch has no negative strides, so a reversed view cannot be built.
         # torch.flip copies, which would make the layout contiguous and turn
         # the check into a comparison of a value against itself.

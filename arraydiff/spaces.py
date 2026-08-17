@@ -55,6 +55,22 @@ def float_values(dtype: np.dtype, *, rng: np.random.Generator, n_random: int = 2
     return np.array(vals, dtype=dtype)
 
 
+def special_pairs(dtype: np.dtype, specials=None):
+    """Every special value against every other, as two aligned arrays.
+
+    Binary bugs live in the combinations rather than in the values. Building the
+    second operand by rotating the first only ever produces the pairings that
+    the rotation happens to make: with a shift of 3, `0.0` never lines up with
+    `-0.0`, so a `minimum` that returns the wrong zero is invisible no matter how
+    many random draws are added. Torch's #193781 is that bug, and this is what
+    finds it.
+
+    Cheap enough to always be on: 15 specials is 225 pairs.
+    """
+    vals = np.array(SPECIAL_FLOATS if specials is None else specials, dtype=dtype)
+    return np.repeat(vals, len(vals)), np.tile(vals, len(vals))
+
+
 def int_values(dtype: np.dtype, *, rng: np.random.Generator, n_random: int = 128):
     info = np.iinfo(dtype)
     vals = [v for v in SPECIAL_INTS if info.min <= v <= info.max]

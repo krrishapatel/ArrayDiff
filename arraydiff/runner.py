@@ -6,6 +6,7 @@ import numpy as np
 
 from .checks import (
     _to_numpy,
+    check_device_invariance,
     check_divmod_identity,
     check_layout_invariance,
     check_numpy_semantics,
@@ -13,7 +14,13 @@ from .checks import (
     check_ulp,
     Finding,
 )
-from .spaces import LAYOUTS, float_values, int_values
+from .spaces import (
+    LAYOUTS,
+    SPECIAL_INTS,
+    float_values,
+    int_values,
+    special_pairs,
+)
 
 # NumPy has no bfloat16, so its entry has no NumPy dtype and the checks that
 # need an oracle skip it. Everything oracle-free still runs on it.
@@ -62,14 +69,27 @@ def run(be, *, seed=0, only=None, n_random=256, verbose=False):
                 continue
             if "f" not in op.kinds:
                 continue
-            vals = base if op.domain is None else op.domain(base).astype(gen_dtype)
-
-            # 1. layout invariance (no oracle needed)
+            # Binary ops get the full cross product of the special values as
+            # well, so that every combination of zeros, infinities and NaNs is
+            # actually tried. Rotating one operand against the other never
+            # produces most of them.
+            raw_a, raw_b = base, None
+            if op.arity == 2:
+                pair_a, pair_b = special_pairs(gen_dtype)
+                raw_a = np.concatenate([pair_a, base])
+                raw_b = np.concatenate([pair_b, _second_operand(base, None, gen_dtype, rng)])
+            vals = raw_a if op.domain is None else op.domain(raw_a).astype(gen_dtype)
             vals_b = (
                 None
-                if op.arity == 1
-                else _second_operand(base, op, gen_dtype, rng)[: len(vals)]
+                if raw_b is None
+                else (
+                    raw_b
+                    if op.domain_b is None
+                    else op.domain_b(raw_b).astype(gen_dtype)
+                )
             )
+
+            # 1. layout invariance (no oracle needed)
             got, err = check_layout_invariance(
                 be, op, vals, dname, mdtype, values_b=vals_b
             )
@@ -84,6 +104,12 @@ def run(be, *, seed=0, only=None, n_random=256, verbose=False):
             )
             findings += got
 
+            # 1c. device invariance (no oracle needed either)
+            got, err = check_device_invariance(
+                be, op, vals, dname, mdtype, values_b=vals_b
+            )
+            findings += got
+
             # 2. numpy semantics + 3. ULP, on the contiguous layout
             arr, arr_np = LAYOUTS["contiguous"](be, vals, mdtype)
             if op.arity == 1:
@@ -91,8 +117,7 @@ def run(be, *, seed=0, only=None, n_random=256, verbose=False):
                     findings += check_numpy_semantics(be, op, (arr,), (arr_np,), dname)
                     findings += check_ulp(be, op, arr, arr_np, dname, ndtype)
             else:
-                b = _second_operand(base, op, gen_dtype, rng)
-                b_arr, b_np = LAYOUTS["contiguous"](be, b, mdtype)
+                b_arr, b_np = LAYOUTS["contiguous"](be, vals_b, mdtype)
                 if ndtype is not None:
                     findings += check_numpy_semantics(
                         be, op, (arr, b_arr), (arr_np, b_np), dname
@@ -120,11 +145,25 @@ def run(be, *, seed=0, only=None, n_random=256, verbose=False):
                 continue
             if "i" not in op.kinds:
                 continue
-            b = None if op.arity == 1 else _nonzero_int(base, ndtype, rng)
+            a, b = base, None
+            if op.arity == 2:
+                # Same reason as the float path: the interesting integer cases
+                # are combinations, e.g. INT_MIN // -1.
+                info = np.iinfo(ndtype)
+                pair_a, pair_b = special_pairs(
+                    ndtype, [v for v in SPECIAL_INTS if info.min <= v <= info.max]
+                )
+                a = np.concatenate([pair_a, base])
+                b = _nonzero_int(
+                    np.concatenate([pair_b, np.roll(base, 3)]), ndtype
+                )
             findings += check_size_invariance(
-                be, op, base, dname, mdtype, values_b=b
+                be, op, a, dname, mdtype, values_b=b
             )[0]
-            arr, arr_np = LAYOUTS["contiguous"](be, base, mdtype)
+            findings += check_device_invariance(
+                be, op, a, dname, mdtype, values_b=b
+            )[0]
+            arr, arr_np = LAYOUTS["contiguous"](be, a, mdtype)
             if op.arity == 1:
                 findings += check_numpy_semantics(be, op, (arr,), (arr_np,), dname)
             else:
@@ -147,7 +186,10 @@ def _second_operand(base, op, gen_dtype, rng):
     return b
 
 
-def _nonzero_int(base, ndtype, rng):
-    b = np.roll(base, 3).astype(ndtype)
+def _nonzero_int(values, ndtype):
+    """Divisors with the zeros replaced. Applied to every binary integer op, not
+    just the dividing ones, because integer division by zero traps rather than
+    returning a value to compare."""
+    b = np.asarray(values).astype(ndtype)
     b[b == 0] = 1
     return b

@@ -16,7 +16,8 @@ import pytest
 from dataclasses import replace
 
 from arraydiff.backends import numpy_backend
-from arraydiff.checks import check_divmod_identity
+from arraydiff.checks import check_device_invariance, check_divmod_identity
+from arraydiff.ops import Op
 
 FLOATS = [("float16", np.float16), ("float32", np.float32), ("float64", np.float64)]
 INTS = [("int8", np.int8), ("int16", np.int16), ("int32", np.int32), ("int64", np.int64)]
@@ -103,6 +104,91 @@ class TestDivmodIdentity:
         assert "divmod-identity" in checks
         # The same input also trips the oracle-free cross-check, which is fine.
         assert "divmod-vs-floor_divide" in checks
+
+
+def two_devices(first, second, *, tags=(), arity=1):
+    """A backend with two devices whose kernels differ.
+
+    NumPy has only one implementation per op, so a second one has to be built:
+    the op returns `first` on the reference device and `second` on the other,
+    which is what a real second device is. `to_device` is the identity, so the
+    values reaching both kernels are provably the same and any difference is the
+    kernel's.
+    """
+    calls = []
+
+    def fn(*args):
+        calls.append(1)
+        return (first if len(calls) == 1 else second)(*args)
+
+    be = replace(NUMPY, devices=("here", "there"), to_device=lambda a, d: a)
+    return be, Op(name="probe", arity=arity, fn=fn, numpy=None, tags=tags)
+
+
+VALUES = np.array([1.0, 2.0, 3.0, 4.0])
+
+
+class TestDeviceInvariance:
+    """Two devices, and the bar for reporting a difference between them."""
+
+    def test_agreeing_devices_report_nothing(self):
+        be, op = two_devices(np.abs, np.abs)
+        found, err = check_device_invariance(be, op, VALUES, "float64")
+        assert (found, err) == ([], None)
+
+    def test_a_backend_with_one_device_skips(self):
+        """No second device means nothing to compare. It has to skip rather than
+        compare the reference against itself and pass for free."""
+        be, op = two_devices(np.abs, np.negative)
+        be = replace(be, devices=("here",))
+        assert check_device_invariance(be, op, VALUES, "float64") == ([], None)
+        assert check_device_invariance(
+            replace(be, to_device=None), op, VALUES, "float64"
+        ) == ([], None)
+
+    def test_an_exact_op_is_held_to_the_last_bit(self):
+        """add is correctly rounded, so the two devices must agree exactly."""
+        be, op = two_devices(
+            np.abs, lambda a: np.nextafter(np.abs(a), np.inf), tags=("exact",)
+        )
+        found, _ = check_device_invariance(be, op, VALUES, "float64")
+        assert len(found) == 1
+        assert found[0].check == "device-invariance"
+        assert "there differs from here" in found[0].detail
+
+    def test_a_transcendental_gets_the_last_bit(self):
+        """Nobody promises a Metal exp matches an Accelerate exp bit for bit, so
+        reporting one ULP here would bury the real findings."""
+        be, op = two_devices(np.exp, lambda a: np.nextafter(np.exp(a), np.inf))
+        assert check_device_invariance(be, op, VALUES, "float64") == ([], None)
+
+    def test_a_transcendental_does_not_get_a_nan(self):
+        """The other half of the same rule: rounding cannot turn a number into a
+        NaN, so that difference is a finding on any device."""
+        be, op = two_devices(np.exp, lambda a: np.full(a.shape, np.nan))
+        found, _ = check_device_invariance(be, op, VALUES, "float64")
+        assert len(found) == 1
+        assert "differs in kind" in found[0].detail
+
+    def test_a_binary_op_moves_both_operands(self):
+        be, op = two_devices(
+            np.minimum, lambda a, b: np.maximum(a, b), tags=("exact",), arity=2
+        )
+        found, _ = check_device_invariance(
+            be, op, VALUES, "float64", values_b=VALUES[::-1].copy()
+        )
+        assert len(found) == 1
+        assert len(found[0].inputs) == 2
+
+    def test_an_unsupported_dtype_is_not_a_finding(self):
+        """float64 on MPS raises rather than returning a wrong answer. That is a
+        documented limit, so it has to skip."""
+
+        def unsupported(_):
+            raise TypeError("not implemented for this device")
+
+        be, op = two_devices(np.abs, unsupported)
+        assert check_device_invariance(be, op, VALUES, "float64") == ([], None)
 
 
 class TestAgainstNumpyItself:

@@ -22,6 +22,7 @@ from .oracles import (
     bitwise_diff,
     bitwise_equal,
     budget_for,
+    categorical_diff,
     ulp_error,
 )
 from .spaces import LAYOUTS
@@ -177,6 +178,74 @@ def check_size_invariance(be, op, values, dtype_name, mdtype=None, *, values_b=N
                 ),
                 got=f"length {size}={out[bad]!r}",
                 want=f"length {n}={flat_ref[bad]!r}",
+            )
+        )
+    return findings, None
+
+
+def check_device_invariance(be, op, values, dtype_name, mdtype=None, *, values_b=None):
+    """The same values on another device must give the same answer.
+
+    The third axis that carries no numerical information, after layout and
+    length. It is worth its own check because a second device is a second
+    implementation: CPU and GPU kernels are written separately, often years
+    apart, and the special-case handling is where they drift.
+
+    The bar is not bit equality here, and that distinction is the whole check.
+    Nobody promises a Metal transcendental matches Accelerate in the last bit,
+    and torch documents as much, so demanding it would bury real findings under
+    a wall of rounding. Ops tagged "exact" are held to bit equality, since
+    IEEE 754 or the op's own definition pins their result on any device. For the
+    rest only `categorical_diff` counts: a NaN, an infinity, or a zero sign
+    cannot be a rounding difference no matter which device produced it.
+    """
+    if be.to_device is None or len(be.devices) < 2:
+        return [], None
+    ref_dev = be.devices[0]
+    exact = "exact" in op.tags
+    findings = []
+
+    def build(device):
+        arrs = [LAYOUTS["contiguous"](be, values, mdtype)[0]]
+        if values_b is not None:
+            arrs.append(LAYOUTS["contiguous"](be, values_b, mdtype)[0])
+        return [be.to_device(a, device) for a in arrs]
+
+    try:
+        ref_arrs = build(ref_dev)
+        ref_out = _to_numpy(be, _apply(be, op, *ref_arrs))
+    except Exception as exc:
+        return [], str(exc)
+
+    for device in be.devices[1:]:
+        try:
+            arrs = build(device)
+            out = _to_numpy(be, _apply(be, op, *arrs))
+        except Exception:
+            # The dtype or the op is missing on this device. float64 on MPS is
+            # the common one, and it is a documented limit rather than a finding.
+            continue
+        if out.shape != ref_out.shape:
+            continue
+        diff = bitwise_diff(out, ref_out) if exact else categorical_diff(out, ref_out)
+        if not diff.any():
+            continue
+        bad = int(np.argmax(diff.reshape(-1)))
+        kind = "differs" if exact else "differs in kind"
+        findings.append(
+            Finding(
+                check="device-invariance",
+                op=op.name,
+                dtype=dtype_name,
+                detail=(
+                    f"{device} {kind} from {ref_dev} on "
+                    f"{int(diff.sum())}/{out.size} elements"
+                ),
+                inputs=tuple(
+                    float(_to_numpy(be, a).reshape(-1)[bad]) for a in ref_arrs
+                ),
+                got=f"{device}={out.reshape(-1)[bad]!r}",
+                want=f"{ref_dev}={ref_out.reshape(-1)[bad]!r}",
             )
         )
     return findings, None

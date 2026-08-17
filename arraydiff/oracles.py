@@ -179,6 +179,36 @@ def bitwise_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return ~(both_nan | same)
 
 
+def categorical_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """The subset of `bitwise_diff` that rounding cannot explain.
+
+    Needed for the one axis where bit equality is not the contract. Two devices
+    run different code for a transcendental, and nobody promises they agree in
+    the last bit, so reporting every difference there would be the same mistake
+    as demanding 1 ULP of expm1. But a difference in *kind* is never rounding:
+    NaN against a number, an infinity against a finite value, an infinity or a
+    zero with the other sign, or an exact zero where the other device returned
+    something nonzero. Those are specified exactly, in every precision, by IEEE
+    754 and by the op's own definition, so they are findings on any device.
+
+    Integers have no accuracy axis at all, so every difference is categorical.
+    """
+    diff = bitwise_diff(a, b)
+    a, b = np.asarray(a), np.asarray(b)
+    if a.dtype.kind != "f" or b.dtype.kind != "f":
+        return diff
+    with np.errstate(invalid="ignore"):
+        a64, b64 = a.astype(np.float64), b.astype(np.float64)
+        nan = np.isnan(a64) != np.isnan(b64)
+        inf = np.isinf(a64) != np.isinf(b64)
+        both_inf = np.isinf(a64) & np.isinf(b64)
+        zero_a, zero_b = a64 == 0, b64 == 0
+        sign = np.signbit(a64) != np.signbit(b64)
+        return diff & (
+            nan | inf | (both_inf & sign) | (zero_a != zero_b) | (zero_a & zero_b & sign)
+        )
+
+
 def bitwise_equal(a: np.ndarray, b: np.ndarray) -> bool:
     """Whether `a` and `b` agree bit for bit. See bitwise_diff."""
     a, b = np.asarray(a), np.asarray(b)

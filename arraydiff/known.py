@@ -11,7 +11,11 @@ PR already covers it. Remove one when upstream changes its mind.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import Callable
+
+import numpy as np
 
 
 FLOATS = ("float16", "float32", "float64", "bfloat16")
@@ -28,6 +32,11 @@ class Known:
     # None means "every dtype". A tuple restricts to those dtypes, which matters
     # when the same check fires on ints and floats for unrelated reasons.
     dtype: str | tuple[str, ...] | None = None
+    # An extra condition on the finding itself, for a cause that only applies to
+    # part of an op's input range. Without it, suppressing a documented underflow
+    # in `exp` would also suppress every other accuracy bug in `exp`, which is
+    # how a known-list starts hiding regressions.
+    when: Callable[[object], bool] | None = None
 
     def matches(self, finding) -> bool:
         ops = (self.op,) if isinstance(self.op, str) else self.op
@@ -36,6 +45,7 @@ class Known:
             self.check == finding.check
             and finding.op in ops
             and (dtypes is None or finding.dtype in dtypes)
+            and (self.when is None or self.when(finding))
         )
 
 
@@ -303,6 +313,61 @@ TORCH_KNOWN = [
         ),
         ref="https://github.com/pytorch/pytorch/issues/193754",
     ),
+    # minimum/maximum on a pair of zeros. std::min(a, b) is b < a ? b : a, which
+    # is sign-blind on zeros and returns whichever operand it was handed first,
+    # while vminq_f32 is sign-aware. So the answer depends on which kernel ran,
+    # which is why this fires on all three oracle-free axes at once.
+    *[
+        Known(
+            check=check,
+            op=("minimum", "maximum"),
+            dtype=FLOATS,
+            reason=(
+                "A zero result gets a sign that depends on which kernel ran. The "
+                "scalar path is std::min, which returns b < a ? b : a and so "
+                "ignores the sign of a zero, and the NEON path is vminq_f32, "
+                "which is sign-aware. minimum(0.0, -0.0) is therefore -0.0 in a "
+                "long tensor and 0.0 in a short one. Filed as #193781."
+            ),
+            ref="https://github.com/pytorch/pytorch/issues/193781",
+        )
+        for check in ("layout-invariance", "size-invariance", "numpy-semantics")
+    ],
+    Known(
+        check="device-invariance",
+        op="abs",
+        dtype=INTS,
+        reason=(
+            "MPS computed integer abs by converting to float32, so abs rounded "
+            "above 2^24: abs(int32(-123456789)) came back 123456792, and int64 "
+            "lost even more. Fixed in main by #190053, which added an integer "
+            "overload to abs_functor, so this reproduces on 2.13.0 only."
+        ),
+        ref="https://github.com/pytorch/pytorch/pull/190053",
+    ),
+    Known(
+        check="device-invariance",
+        op=(
+            "add", "subtract", "multiply", "divide", "reciprocal",
+            "ceil", "floor", "sign", "logical_not",
+            "expm1", "logaddexp", "arctan2",
+        ),
+        dtype=("float32",),
+        reason=(
+            "Metal flushes float32 subnormals to zero, so every one of these "
+            "reports on an input or a result near 1e-38. The consequences look "
+            "unrelated but are one cause: sign(1.4e-45) is 0, ceil(1.4e-45) is "
+            "0.0 rather than 1.0, and 1.4e-45 * inf is NaN rather than inf "
+            "because the operand became a zero first. Documented in the Metal "
+            "Shading Language Specification, which permits flushing denormals "
+            "on input and output. float16 and bfloat16 do not report, since "
+            "their subnormals are far larger than the flush threshold."
+        ),
+        ref=(
+            "https://developer.apple.com/metal/"
+            "Metal-Shading-Language-Specification.pdf"
+        ),
+    ),
 ]
 
 
@@ -319,6 +384,25 @@ _JAX_DAZ_REF = (
     "https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html"
     "#double-64bit-precision"
 )
+
+def _exp_underflows_to_subnormal(finding) -> bool:
+    """Whether `exp` of this input lands in the subnormal range of its dtype.
+
+    That band is narrow, about x in [-745.1, -708.4] for float64, and it is
+    exactly where a flush to zero turns into an unbounded ULP error: below it the
+    true result is smaller than the smallest subnormal, so returning 0.0 is
+    correct and the measured error is already 0. Whether the sweep happens to
+    draw a value inside the band depends on the sample size, which is why this
+    has to be an entry rather than left to luck.
+    """
+    if finding.dtype not in ("float32", "float64"):
+        return False
+    try:
+        y = math.exp(finding.inputs[0])
+    except (OverflowError, ValueError):
+        return False
+    return 0 < y < float(np.finfo(finding.dtype).smallest_normal)
+
 
 JAX_KNOWN = [
     Known(
@@ -413,6 +497,21 @@ JAX_KNOWN = [
             "sign. Some elements in this finding are the DAZ flush instead."
         ),
         ref="https://github.com/jax-ml/jax/issues/40028",
+    ),
+    Known(
+        check="ulp",
+        op="exp",
+        dtype=("float32", "float64"),
+        when=_exp_underflows_to_subnormal,
+        reason=(
+            "The same flush to zero as the arithmetic entries, reached through "
+            "the accuracy check instead. exp(-715.4) is 2.1e-311, a subnormal, "
+            "and XLA returns 0.0, which is an error of 4e12 ULP rather than a "
+            "small one. Restricted to inputs whose exact result is actually "
+            "subnormal, so a real accuracy bug in exp anywhere else is still "
+            "reported."
+        ),
+        ref=_JAX_DAZ_REF,
     ),
 ]
 
