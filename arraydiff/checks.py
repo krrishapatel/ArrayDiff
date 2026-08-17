@@ -214,6 +214,19 @@ def check_ulp(mx, op, arr_mx, arr_np, dtype_name, ndtype=None, *, budget=None):
     ]
 
 
+# In floating point `q*b + r == a` does not hold exactly, and demanding that it
+# does is a bug in the test: the floored remainder is `fmod(a, b) + b`, which
+# rounds. NumPy misses exact reconstruction on 54 of 400 float32 pairs.
+#
+# The tolerance is measured at the scale of `q*b`, not of `a`. Forming `q*b + r`
+# can cancel almost everything, so the error belongs to the larger intermediate:
+# for `divmod(0.1, -2.5)` NumPy returns q=-1, r=-2.4 and reconstructs 2.5 - 2.4,
+# which is 13 ULP away from 0.1 but well under 1 ULP of 2.5. Scaling by |a| would
+# flag NumPy; scaling by the larger term does not, and still catches a quotient
+# that is off by a whole step, which is the mlx bug this was written for.
+DIVMOD_RECON_ULP = 4.0
+
+
 def check_divmod_identity(mx, a_mx, b_mx, a_np, b_np, dtype_name):
     """divmod must satisfy q*b + r == a, and agree with floor_divide/remainder.
 
@@ -231,8 +244,33 @@ def check_divmod_identity(mx, a_mx, b_mx, a_np, b_np, dtype_name):
     q_n, r_n = _to_numpy(mx, q), _to_numpy(mx, r)
     finite = np.isfinite(a_np) & np.isfinite(b_np) & (b_np != 0)
 
-    recon = q_n.astype(np.float64) * b_np.astype(np.float64) + r_n.astype(np.float64)
-    ok = ~finite | (recon == a_np.astype(np.float64))
+    if a_np.dtype.kind in "iub":
+        # Reconstruct with the dtype's own wraparound. A fixed width integer only
+        # satisfies the identity modulo 2**n, and int8 -128 // -1 is the case that
+        # proves it: the true quotient 128 is not representable, so NumPy returns
+        # -128. Reconstructing in float64 would call that a bug.
+        with np.errstate(over="ignore"):
+            recon = (q_n * b_np + r_n).astype(a_np.dtype)
+        close = recon == a_np
+    else:
+        a64, b64 = a_np.astype(np.float64), b_np.astype(np.float64)
+        # A quotient too large for the dtype has to come back infinite, and then
+        # nothing can reconstruct `a`. NumPy fails the identity here too, on
+        # divmod(65504, -6e-08) in float16 for one, so judging it would be
+        # judging the format. The true quotient is taken in float64 rather than
+        # from the library, so a library that overflows early is still caught.
+        with np.errstate(all="ignore"):
+            true_q = np.floor(a64 / b64)
+        finite = finite & np.isfinite(true_q)
+        finite = finite & (np.abs(true_q) <= float(np.finfo(a_np.dtype).max))
+
+        prod = q_n.astype(np.float64) * b64
+        recon = prod + r_n.astype(np.float64)
+        scale = np.maximum(np.abs(prod), np.abs(a64))
+        close = np.abs(recon - a64) <= (
+            DIVMOD_RECON_ULP * _spacing_in(scale.astype(a_np.dtype), dtype_name)
+        )
+    ok = ~finite | close
     if not np.all(ok):
         bad = int(np.argmin(ok))
         findings.append(
@@ -264,6 +302,26 @@ def _apply(mx, op, *arrays):
 
 def _at(a, i):
     return a.reshape(-1)[i].item()
+
+
+# bfloat16 keeps 8 mantissa bits against float32's 24, and _to_numpy widens it to
+# float32, so float32 spacing understates a bfloat16 ULP by this much.
+_BF16_ULP_RATIO = 2**16
+
+
+def _spacing_in(a_np, dtype_name=None):
+    """ULP width at each element, in the precision the op actually ran in.
+
+    Same reason as `ulp_error`: float64 spacing would understate a float16 ULP by
+    about 1e12 and turn a passing implementation into a wall of findings.
+    """
+    a = np.abs(np.asarray(a_np))
+    if a.dtype.kind != "f":
+        return np.ones(a.shape, dtype=np.float64)
+    step = np.spacing(a).astype(np.float64)
+    if dtype_name == "bfloat16":
+        step = step * _BF16_ULP_RATIO
+    return np.where(step > 0, step, float(np.finfo(a.dtype).tiny))
 
 
 def _first_diff(a, b):

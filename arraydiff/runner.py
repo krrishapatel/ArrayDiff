@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from .checks import (
+    _to_numpy,
     check_divmod_identity,
     check_layout_invariance,
     check_numpy_semantics,
@@ -90,7 +91,14 @@ def run(mx, *, seed=0, only=None, n_random=256, verbose=False):
             b = _second_operand(base, None, gen_dtype, rng)
             a_mx = LAYOUTS["contiguous"](mx, a, mdtype)[0]
             b_mx = LAYOUTS["contiguous"](mx, b, mdtype)[0]
-            findings += check_divmod_identity(mx, a_mx, b_mx, a, b, dname)
+            # Read the operands back out, so the reference is what the kernel
+            # actually holds rather than what was generated. bfloat16 keeps 8
+            # mantissa bits, so casting moves the float32 values, and 1.4e-45
+            # lands on exactly 0. Comparing against the pre-cast value reported
+            # a correct divide by zero as a bug.
+            findings += check_divmod_identity(
+                mx, a_mx, b_mx, _to_numpy(mx, a_mx), _to_numpy(mx, b_mx), dname
+            )
 
     for dname, mdtype, ndtype in int_dtypes(mx):
         base = int_values(ndtype, rng=rng, n_random=128)

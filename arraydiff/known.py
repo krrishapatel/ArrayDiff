@@ -14,6 +14,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+FLOATS = ("float16", "float32", "float64", "bfloat16")
+INTS = ("int8", "int16", "int32", "int64", "uint8", "uint32")
+
+
 @dataclass(frozen=True)
 class Known:
     check: str
@@ -21,15 +25,17 @@ class Known:
     op: str | tuple[str, ...]
     reason: str
     ref: str
-    # None means "every dtype".
-    dtype: str | None = None
+    # None means "every dtype". A tuple restricts to those dtypes, which matters
+    # when the same check fires on ints and floats for unrelated reasons.
+    dtype: str | tuple[str, ...] | None = None
 
     def matches(self, finding) -> bool:
         ops = (self.op,) if isinstance(self.op, str) else self.op
+        dtypes = (self.dtype,) if isinstance(self.dtype, str) else self.dtype
         return (
             self.check == finding.check
             and finding.op in ops
-            and (self.dtype is None or self.dtype == finding.dtype)
+            and (dtypes is None or finding.dtype in dtypes)
         )
 
 
@@ -47,27 +53,31 @@ MLX_KNOWN = [
     Known(
         check="numpy-semantics",
         op="floor_divide",
+        dtype=INTS,
         reason=(
             "Integer floor_divide truncates toward zero instead of flooring. "
-            "Already filed, and PR #4108 is open against it."
+            "Filed as #4119. PR #4108 is approved but its fix subtracts the "
+            "remainder first, which overflows the small dtypes, so int8 and "
+            "int16 come out with the wrong sign. Raised on the #4108 thread."
         ),
-        ref="https://github.com/ml-explore/mlx/pull/4108",
+        ref="https://github.com/ml-explore/mlx/issues/4119",
     ),
     Known(
         check="divmod-vs-floor_divide",
         op="divmod",
         reason=(
             "divmod truncates the quotient while floor_divide floors, so the "
-            "two disagree. Filed as #4119 with PRs #4108 and #4311 open."
+            "two disagree. Filed as #4119 with PR #4108 approved."
         ),
         ref="https://github.com/ml-explore/mlx/issues/4119",
     ),
     Known(
         check="divmod-identity",
         op="divmod",
+        dtype=INTS,
         reason=(
-            "q*b + r != a follows from the same truncation as #4119; the "
-            "remainder is not adjusted to match the quotient."
+            "For integers q*b + r != a follows from the same truncation as "
+            "#4119; the remainder is not adjusted to match the quotient."
         ),
         ref="https://github.com/ml-explore/mlx/issues/4119",
     ),
