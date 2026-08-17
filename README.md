@@ -122,45 +122,62 @@ The MLX op table is the only one implemented so far. Against MLX main at
 `c2bcf47` plus the pending `remainder` fix below:
 
 ```
-4 new findings
-     3  numpy-semantics
-     1  divmod-identity
+0 new findings
 
-134 already accounted for in known.py
+138 already accounted for in known.py
    112  https://github.com/ml-explore/mlx/issues/4163
      8  https://github.com/ml-explore/mlx/issues/4162
      8  https://github.com/ml-explore/mlx/issues/4119
+     3  https://github.com/ml-explore/mlx/issues/4317
      3  https://github.com/ml-explore/mlx/issues/3644
      3  https://github.com/ml-explore/mlx/issues/4158
+     1  https://github.com/ml-explore/mlx/pull/4003
 ```
 
-The 134 are the main evidence that the checks work: the tool rediscovers the
-whole known numerical bug cluster without being told about any of it. They are
-suppressed because each one is already filed or already declined, so re-reporting
-them would be noise.
+The 138 are the main evidence that the checks work: the tool rediscovers the
+whole known numerical bug cluster without being told about any of it. Zero new is
+the goal state, not an empty run. Everything the tool finds is now fixed, filed,
+or ruled on, and re-reporting any of it would be noise.
 
-Three bugs came out of running this.
+Two bugs were filed out of running this, and one rediscovery is recorded.
 
 **`remainder` gives a zero result a path dependent sign.** Found by
 `layout-invariance` with no oracle at all, which is what that check is for. It
 reduces to a self contradiction: lane 8 of
 `mx.remainder(mx.full((9,), -0.0), mx.full((9,), 3.0))` disagrees with lanes 0 to
 7 on identical inputs, because the Accelerate SIMD body and the scalar residual
-produce zeros of different signs and the floored fixup skips zero. Fixed across
-all four backends, and the sweep against the fixed build is what the numbers above
-are measured on.
-
-**`divmod` computes the quotient by dividing a second time**, so it can disagree
-with its own remainder. `divmod(mx.array([2144.0], mx.bfloat16), 358.0)` returns
-`q = 6` where the floor is 5, because `5.9888` rounds to exactly `6.0` in
-bfloat16 and `floor` cannot undo it. This is the one `divmod-identity` above.
-Reported on the thread of the approved PR in this area, along with an integer
-overflow in the same PR's `floor_divide` shortcut, where `a - remainder(a, b)`
-leaves the dtype range and `mx.int8(120) // -27` comes back `4` instead of `-5`.
+produce zeros of different signs and the floored fixup skips zero. Filed as
+[#4315](https://github.com/ml-explore/mlx/issues/4315) and fixed across all four
+backends in [#4316](https://github.com/ml-explore/mlx/pull/4316); the sweep
+against that build is what the numbers above are measured on.
 
 **`floor_divide` disagrees with both NumPy and Python at infinity.** `inf // -3.0`
 gives `-inf` where both references give `nan`, and `1.0 // -inf` gives `-0.0`
-where both give `-1.0`. That is the three `numpy-semantics` findings.
+where both give `-1.0`. `floor(a / b)` is not what `//` means once an operand is
+infinite. Filed as
+[#4317](https://github.com/ml-explore/mlx/issues/4317), and it is the three
+`numpy-semantics` entries above.
+
+**`divmod` computes the quotient by dividing a second time**, so `q*b + r` can be
+off by a whole divisor. `divmod(mx.array([2144.0], mx.bfloat16), 358.0)` returns
+`q = 6` where the floor is 5, because `5.9888` rounds to exactly `6.0` in
+bfloat16 and `floor` cannot undo it.
+
+This one is a rediscovery, and it is the more useful entry in `known.py` for it.
+[PR #4003](https://github.com/ml-explore/mlx/pull/4003) found the
+half-precision half of it months earlier and was closed: widening the division
+adds overhead, and PyTorch was cited as behaving the same way. So the tool was
+reporting a decision that had already been made, which is the failure mode this
+project is supposed to avoid, and it is suppressed on those grounds rather than
+on my disagreeing with it.
+
+Two things about it did seem worth raising on the open PR in this area. PyTorch's
+floor division is not `floor(a / b)`: `div_floor_floating` derives the quotient
+from the remainder, the same as NumPy, and is vectorized. And float64 breaks the
+same way, `divmod(1.0, 0.1)` giving `q = 10`, where widening has nothing to widen
+to. Also raised there: an integer overflow in that PR's `floor_divide` shortcut,
+where `a - remainder(a, b)` leaves the dtype range and `mx.int8(120) // -27`
+comes back `4` instead of `-5`.
 
 Adding a library means writing an op table like `ops.py` and a `known.py` list.
 The checks themselves are library-agnostic.

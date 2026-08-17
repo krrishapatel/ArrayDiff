@@ -63,6 +63,36 @@ MLX_KNOWN = [
         ref="https://github.com/ml-explore/mlx/issues/4119",
     ),
     Known(
+        check="numpy-semantics",
+        op="floor_divide",
+        dtype=FLOATS,
+        reason=(
+            "The float path is floor(a / b), which is not what // means at "
+            "infinity: inf // -3.0 gives -inf where NumPy and Python both give "
+            "nan, and 1.0 // -inf gives -0.0 where both give -1.0. Filed as "
+            "#4317."
+        ),
+        ref="https://github.com/ml-explore/mlx/issues/4317",
+    ),
+    Known(
+        check="divmod-identity",
+        op="divmod",
+        dtype=FLOATS,
+        reason=(
+            "The quotient is floor(x / y), a second division, so it can round "
+            "up past its own floor and then q*b + r is off by a whole divisor: "
+            "in bfloat16 2144 / 358 is 5.9888, which rounds to exactly 6.0. "
+            "PR #4003 fixed the half-precision half of this by widening the "
+            "division and was closed, on the grounds that it adds overhead and "
+            "that PyTorch behaves the same way. Recorded as ruled-on rather "
+            "than new. Re-raised on the #4108 thread, because PyTorch actually "
+            "derives the quotient from the remainder rather than dividing "
+            "twice, and because float64 breaks the same way with no wider type "
+            "to escape to."
+        ),
+        ref="https://github.com/ml-explore/mlx/pull/4003",
+    ),
+    Known(
         check="divmod-vs-floor_divide",
         op="divmod",
         reason=(
