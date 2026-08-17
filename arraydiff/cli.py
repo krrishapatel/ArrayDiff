@@ -7,6 +7,27 @@ import sys
 from collections import Counter
 
 
+def _load_backend(name):
+    from .backends import mlx_backend, torch_backend
+
+    if name == "mlx":
+        try:
+            import mlx.core as mx
+        except ImportError:
+            print(
+                "mlx is not importable; set PYTHONPATH to an mlx build",
+                file=sys.stderr,
+            )
+            return None
+        return mlx_backend(mx)
+    try:
+        import torch
+    except ImportError:
+        print("torch is not importable", file=sys.stderr)
+        return None
+    return torch_backend(torch)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="arraydiff",
@@ -23,25 +44,26 @@ def main(argv=None):
         action="store_true",
         help="also print divergences that known.py already accounts for",
     )
+    ap.add_argument(
+        "--backend", default="mlx", choices=("mlx", "torch"), help="library to test"
+    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
-    try:
-        import mlx.core as mx
-    except ImportError:
-        print("mlx is not importable; set PYTHONPATH to an mlx build", file=sys.stderr)
+    be = _load_backend(args.backend)
+    if be is None:
         return 2
 
-    from .known import partition
+    from .known import known_for, partition
     from .runner import run
 
     findings = run(
-        mx, seed=args.seed, only=args.only, n_random=args.random, verbose=args.verbose
+        be, seed=args.seed, only=args.only, n_random=args.random, verbose=args.verbose
     )
     if args.check:
         findings = [f for f in findings if f.check in args.check]
 
-    new, already_known = partition(findings)
+    new, already_known = partition(findings, known_for(be.name))
 
     for f in new:
         print(f)

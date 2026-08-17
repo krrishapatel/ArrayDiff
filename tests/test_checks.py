@@ -13,6 +13,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from dataclasses import replace
+
+from arraydiff.backends import numpy_backend
 from arraydiff.checks import check_divmod_identity
 
 FLOATS = [("float16", np.float16), ("float32", np.float32), ("float64", np.float64)]
@@ -25,33 +28,17 @@ HARD = [0.1, -0.1, 1.0, -1.0, 2.5, -2.5, 7.0, -7.0, 3.0, -3.0,
         0.3, -0.3, 0.7, -0.7, 13.0, -13.0, 1e3, -1e3]
 
 
-class NumpyAsMX:
-    """Presents NumPy through the small surface the checks call."""
+# The real NumPy backend, not a stand-in. An earlier version of this file used a
+# hand-written shim, and because it was missing the `ops` table the check caught
+# the AttributeError, returned no findings, and two tests passed for that reason
+# instead of for the right one.
+NUMPY = numpy_backend()
 
-    float16, float32, float64 = np.float16, np.float32, np.float64
-    int8, int16, int32, int64 = np.int8, np.int16, np.int32, np.int64
-    # NumPy has no bfloat16; a sentinel keeps `_to_numpy`'s dtype test falsy.
-    bfloat16 = object()
 
-    @staticmethod
-    def array(values, dtype=None):
-        return np.asarray(values, dtype=dtype)
-
-    @staticmethod
-    def divmod(a, b):
-        return np.divmod(a, b)
-
-    @staticmethod
-    def floor_divide(a, b):
-        return np.floor_divide(a, b)
-
-    @staticmethod
-    def remainder(a, b):
-        return np.remainder(a, b)
-
-    @staticmethod
-    def eval(*args):
-        return None
+def with_divmod(fn):
+    """The same backend with a deliberately broken divmod, to prove the check
+    fires. Everything else stays real."""
+    return replace(NUMPY, divmod=fn)
 
 
 def _all_pairs(values, dtype):
@@ -66,7 +53,7 @@ class TestDivmodIdentity:
     def test_numpy_passes_in_every_float_precision(self, name, dtype):
         a, b = _all_pairs(HARD, dtype)
         with np.errstate(all="ignore"):
-            found = check_divmod_identity(NumpyAsMX, a, b, a, b, name)
+            found = check_divmod_identity(NUMPY, a, b, a, b, name)
         assert found == [], f"the check flags NumPy in {name}: {found}"
 
     @pytest.mark.parametrize("name,dtype", INTS)
@@ -74,7 +61,7 @@ class TestDivmodIdentity:
         vals = [-128, -13, -7, -3, -1, 1, 3, 7, 13, 127]
         a, b = _all_pairs(vals, dtype)
         with np.errstate(all="ignore"):
-            found = check_divmod_identity(NumpyAsMX, a, b, a, b, name)
+            found = check_divmod_identity(NUMPY, a, b, a, b, name)
         assert found == [], f"the check flags NumPy in {name}: {found}"
 
     def test_integers_are_still_judged_exactly(self):
@@ -86,14 +73,14 @@ class TestDivmodIdentity:
         a = np.array([7, -7], np.int32)
         b = np.array([2, 2], np.int32)
 
-        class OffByOne(NumpyAsMX):
-            @staticmethod
-            def divmod(x, y):
-                q, r = np.divmod(x, y)
-                return q + 1, r
+        def off_by_one(x, y):
+            q, r = np.divmod(x, y)
+            return q + 1, r
 
         with np.errstate(all="ignore"):
-            found = check_divmod_identity(OffByOne, a, b, a, b, "int32")
+            found = check_divmod_identity(
+                with_divmod(off_by_one), a, b, a, b, "int32"
+            )
         assert "divmod-identity" in {f.check for f in found}
 
     def test_a_wrong_float_quotient_is_still_caught(self):
@@ -105,14 +92,31 @@ class TestDivmodIdentity:
         a = np.array([1.0], np.float32)
         b = np.array([0.1], np.float32)
 
-        class DividesTwice(NumpyAsMX):
-            @staticmethod
-            def divmod(x, y):
-                return np.floor(x / y), np.fmod(x, y)
+        def divides_twice(x, y):
+            return np.floor(x / y), np.fmod(x, y)
 
         with np.errstate(all="ignore"):
-            found = check_divmod_identity(DividesTwice, a, b, a, b, "float32")
+            found = check_divmod_identity(
+                with_divmod(divides_twice), a, b, a, b, "float32"
+            )
         checks = {f.check for f in found}
         assert "divmod-identity" in checks
         # The same input also trips the oracle-free cross-check, which is fine.
         assert "divmod-vs-floor_divide" in checks
+
+
+class TestAgainstNumpyItself:
+    """Run the whole sweep against NumPy through the backend adapter.
+
+    NumPy is what the oracle-based checks compare to, so it has to come back
+    clean. Anything reported here is a bug in a check, and it covers the
+    oracle-free checks too: NumPy has one code path per op, so any layout or
+    length difference reported against it would be the harness inventing one.
+    """
+
+    def test_the_sweep_reports_nothing(self):
+        from arraydiff.runner import run
+
+        with np.errstate(all="ignore"):
+            found = run(NUMPY, n_random=64)
+        assert found == [], f"a check flags NumPy: {found[:3]}"

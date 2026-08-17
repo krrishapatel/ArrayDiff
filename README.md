@@ -29,6 +29,13 @@ contiguous data, with a scalar fallback that rounds differently. Binary ops are
 covered too, with both operands moved to the same layout at once; an earlier
 version checked only unary ops, which silently skipped `power`.
 
+`size-invariance` is the same argument on the length axis, and it is a separate
+check because length is what picks the kernel: a long array goes through the
+vectorized body and a short one goes through the scalar path, which is usually a
+different algorithm rather than the same one unrolled. Layout invariance cannot
+see this, since every layout it builds is full length. This is the check that
+found the three torch bugs below.
+
 **The budget has to be one a working implementation passes.** Two things go wrong
 here. A flat budget ignores conditioning: `exp` has relative condition number
 `|x|`, so at `x = 700` the input's own rounding forces an error of several hundred
@@ -73,6 +80,7 @@ torch does the same and propagating costs instructions on the hot path.
 | check | needs an oracle | what it means |
 |---|---|---|
 | `layout-invariance` | no | same values, different memory layout, different result |
+| `size-invariance` | no | same values, shorter array, different result |
 | `divmod-identity` | no | `q*b + r == a` fails |
 | `divmod-vs-floor_divide` | no | `divmod`'s quotient disagrees with `floor_divide` |
 | `numpy-semantics` | NumPy | bit-exact disagreement on an op that should be exact |
@@ -101,32 +109,40 @@ differ" and pointed at the wrong input.
 ```bash
 pip install -e '.[dev]'
 
-# MLX is not a dependency; point at whatever build you want to test
+# neither library is a dependency; point at whatever build you want to test
 PYTHONPATH=/path/to/mlx/python arraydiff
 PYTHONPATH=/path/to/mlx/python arraydiff --only tan power --check layout-invariance
+
+arraydiff --backend torch
 ```
 
 Exit status is 1 when there are findings, so it can gate CI.
 
 ```python
+from arraydiff.backends import mlx_backend
+from arraydiff.known import known_for, partition
 from arraydiff.runner import run
-from arraydiff.known import partition
 import mlx.core as mx
 
-new, already_known = partition(run(mx))
+be = mlx_backend(mx)
+new, already_known = partition(run(be), known_for(be.name))
 ```
 
 ## Status
 
-The MLX op table is the only one implemented so far. Against MLX main at
-`c2bcf47` plus the pending `remainder` fix below:
+Two libraries. Both come back clean, which is the goal state rather than an empty
+run: everything either check finds is fixed, filed, or ruled on.
+
+### MLX
+
+Against MLX main at `c2bcf47` plus the pending `remainder` fix below:
 
 ```
 0 new findings
 
-138 already accounted for in known.py
-   112  https://github.com/ml-explore/mlx/issues/4163
-     8  https://github.com/ml-explore/mlx/issues/4162
+228 already accounted for in known.py
+   196  https://github.com/ml-explore/mlx/issues/4163
+    14  https://github.com/ml-explore/mlx/issues/4162
      8  https://github.com/ml-explore/mlx/issues/4119
      3  https://github.com/ml-explore/mlx/issues/4317
      3  https://github.com/ml-explore/mlx/issues/3644
@@ -134,10 +150,8 @@ The MLX op table is the only one implemented so far. Against MLX main at
      1  https://github.com/ml-explore/mlx/pull/4003
 ```
 
-The 138 are the main evidence that the checks work: the tool rediscovers the
-whole known numerical bug cluster without being told about any of it. Zero new is
-the goal state, not an empty run. Everything the tool finds is now fixed, filed,
-or ruled on, and re-reporting any of it would be noise.
+The 228 are the main evidence that the checks work: the tool rediscovers the
+whole known numerical bug cluster without being told about any of it.
 
 Two bugs were filed out of running this, and one rediscovery is recorded.
 
@@ -179,5 +193,74 @@ to. Also raised there: an integer overflow in that PR's `floor_divide` shortcut,
 where `a - remainder(a, b)` leaves the dtype range and `mx.int8(120) // -27`
 comes back `4` instead of `-5`.
 
-Adding a library means writing an op table like `ops.py` and a `known.py` list.
-The checks themselves are library-agnostic.
+### PyTorch
+
+Against torch 2.13.0 on CPU:
+
+```
+0 new findings
+
+52 already accounted for in known.py
+    32  https://pytorch.org/docs/stable/notes/numerical_accuracy.html
+    12  https://github.com/pytorch/pytorch/issues/193753
+     3  https://github.com/pytorch/pytorch/issues/193755
+     3  https://github.com/pytorch/pytorch/issues/187295
+     2  https://github.com/pytorch/pytorch/issues/193754
+```
+
+The 32 are the Sleef-versus-libm last-bit differences, which torch documents as
+allowed and which are therefore not findings. The rest are three bugs filed out
+of this run.
+
+**`fmod` and `remainder` return NaN where the scalar path returns the right
+answer.** `Sleef_fmod` is documented as undefined once `abs(a / b)` reaches
+`1e300` for double or `1e38` for float, and every architecture's
+`Vectorized<T>::fmod` calls it directly, so a long array gets NaN and a short one
+gets a finite value. A maintainer diagnosed this on
+[#77742](https://github.com/pytorch/pytorch/issues/77742) in 2022 and posted the
+`fmod` case himself; that issue was closed by a fix that only covered
+`div(rounding_mode="floor")`, so `fmod_kernel` and `remainder_kernel` still call
+Sleef unguarded. Filed as
+[#193753](https://github.com/pytorch/pytorch/issues/193753).
+
+**`floor_divide` on float16 and bfloat16 depends on the tensor's length, and the
+vectorized result can exceed the quotient it is meant to be the floor of.**
+`torch.floor_divide` on a length-2 bfloat16 tensor gives `560 // 3 == 187`, and
+`187 * 3` is `561`. A length-1 tensor gives `186`. The scalar path promotes to
+float32 through `std::fmod`, while `div_floor_floating_vec` computes in
+`Vectorized<Half>` and rounds to 8 or 11 mantissa bits at every step. 39 of 4000
+random float16 pairs and 65 of 4000 bfloat16 pairs disagree between the two;
+float32 and float64 are clean, which is what pins the cause. Filed as
+[#193754](https://github.com/pytorch/pytorch/issues/193754).
+
+**`remainder` gives a zero result the sign of the dividend, not the divisor.**
+`torch.remainder(torch.tensor([-1.0]), 1.0)` is `-0.0`, where the documented
+contract is that the result has the sign of the divisor, and Python gives `0.0`.
+The sign fixup is guarded on the remainder being nonzero, so the zero case is
+never corrected. Filed as
+[#193755](https://github.com/pytorch/pytorch/issues/193755). This is the same bug
+class as MLX's [#4315](https://github.com/ml-explore/mlx/issues/4315) above,
+found independently in a second library by the same check.
+
+### NumPy
+
+NumPy is also wired up as a backend, and the sweep against it has to come back
+empty. It is the oracle for `numpy-semantics`, and it has one code path per op,
+so any layout or length difference reported against it would be the harness
+inventing one rather than finding one. `tests/test_checks.py` asserts this.
+
+## Adding a library
+
+An adapter in `backends.py` and a `known.py` list. `backends.py` is the whole
+contract: dtypes, array construction, conversion to NumPy, broadcast, and the op
+callables. `ops.py` has one spec list rather than one table per library, because
+two tables drift and an op added for one library and forgotten for another
+silently reduces coverage without failing anything.
+
+Nothing in `checks.py` needs to change, and when it did, that was the useful
+part. Adding torch turned up two assumptions about MLX that had been sitting
+inside supposedly library-agnostic code: `Backend.layouts` exists because torch
+has no negative strides, so `reversed` cannot be built there and comparing a copy
+against itself would have been a silently vacuous check, and `TORCH_NAMES` maps
+`equal` to `torch.eq` because `torch.equal` reduces a whole tensor to one bool,
+which would have made every comparison check pass for free.

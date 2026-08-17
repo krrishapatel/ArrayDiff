@@ -47,16 +47,14 @@ class Finding:
         )
 
 
-def _to_numpy(mx, a):
-    import numpy as np
-
-    if a.dtype == mx.bfloat16:
-        a = a.astype(mx.float32)
-    return np.asarray(a)
+def _to_numpy(be, a):
+    """Kept as a shim so callers read the same as before; the conversion itself
+    is the backend's, since bfloat16 has no NumPy equivalent to convert to."""
+    return be.to_numpy(a)
 
 
 def check_layout_invariance(
-    mx, op, values, dtype_name, mdtype=None, *, layouts=None, values_b=None
+    be, op, values, dtype_name, mdtype=None, *, layouts=None, values_b=None
 ):
     """The same values through different memory layouts must give bit-identical
     results. A difference means the result depends on how the input happened to
@@ -69,19 +67,23 @@ def check_layout_invariance(
     silently skipped it.
     """
     findings = []
-    names = layouts or list(LAYOUTS)
+    # A backend that cannot express a layout is skipped for it rather than given
+    # a copy to compare against itself.
+    names = layouts or [n for n in LAYOUTS if be.layouts is None or n in be.layouts]
+    if len(names) < 2:
+        return [], None
     ref_name = names[0]
 
     def build(layout_name):
-        arr, arr_np = LAYOUTS[layout_name](mx, values, mdtype)
+        arr, arr_np = LAYOUTS[layout_name](be, values, mdtype)
         if values_b is None:
             return (arr,), (arr_np,)
-        b, b_np = LAYOUTS[layout_name](mx, values_b, mdtype)
+        b, b_np = LAYOUTS[layout_name](be, values_b, mdtype)
         return (arr, b), (arr_np, b_np)
 
     ref_arrs, ref_nps = build(ref_name)
     try:
-        ref_out = _to_numpy(mx, _apply(mx, op, *ref_arrs))
+        ref_out = _to_numpy(be, _apply(be, op, *ref_arrs))
     except Exception as exc:  # op unsupported for this dtype
         return [], str(exc)
 
@@ -94,7 +96,7 @@ def check_layout_invariance(
             continue  # layout helper changed the values; skip rather than lie
         arr_np, ref_np = arr_nps[0], ref_nps[0]
         try:
-            out = _to_numpy(mx, _apply(mx, op, *arrs))
+            out = _to_numpy(be, _apply(be, op, *arrs))
         except Exception:
             continue
         if not bitwise_equal(out, ref_out):
@@ -116,7 +118,71 @@ def check_layout_invariance(
     return findings, None
 
 
-def check_numpy_semantics(mx, op, arrays_mx, arrays_np, dtype_name):
+# Lengths short enough to miss the vectorized kernel. 1 is the pure scalar path;
+# 3 and 7 sit just under the common 4-wide float64 and 8-wide float32 registers.
+SIZES = (1, 3, 7)
+
+
+def check_size_invariance(be, op, values, dtype_name, mdtype=None, *, values_b=None):
+    """The same values in a shorter array must give the same results.
+
+    Array length carries no numerical information, so this is the same argument
+    as layout invariance. It is a separate axis because length is what picks the
+    kernel: a long array goes through the vectorized body, and a short one goes
+    through the scalar path, which is often a different algorithm rather than the
+    same one unrolled. Layout invariance cannot see this, since every layout it
+    builds is full length.
+
+    Each length is exercised by running the op over consecutive chunks of that
+    length and stitching the results back together, so every value is covered at
+    every length instead of only the ones that land in the first few slots.
+    """
+    findings = []
+    ref_arr, _ = LAYOUTS["contiguous"](be, values, mdtype)
+    arrs = [ref_arr]
+    if values_b is not None:
+        arrs.append(LAYOUTS["contiguous"](be, values_b, mdtype)[0])
+    try:
+        ref_out = _to_numpy(be, _apply(be, op, *arrs))
+    except Exception as exc:
+        return [], str(exc)
+
+    n = len(values)
+    for size in SIZES:
+        if size >= n:
+            continue
+        try:
+            pieces = [
+                _to_numpy(be, _apply(be, op, *(a[i : i + size] for a in arrs)))
+                for i in range(0, n, size)
+            ]
+        except Exception:
+            continue
+        out = np.concatenate([np.asarray(p).reshape(-1) for p in pieces])[:n]
+        flat_ref = ref_out.reshape(-1)[:n]
+        if bitwise_equal(out, flat_ref):
+            continue
+        bad = _first_diff(out, flat_ref)
+        findings.append(
+            Finding(
+                check="size-invariance",
+                op=op.name,
+                dtype=dtype_name,
+                detail=(
+                    f"length {size} disagrees with length {n} on "
+                    f"{_count_diff(out, flat_ref)}/{n} elements"
+                ),
+                inputs=tuple(
+                    float(_to_numpy(be, a).reshape(-1)[bad]) for a in arrs
+                ),
+                got=f"length {size}={out[bad]!r}",
+                want=f"length {n}={flat_ref[bad]!r}",
+            )
+        )
+    return findings, None
+
+
+def check_numpy_semantics(be, op, arrays_lib, arrays_np, dtype_name):
     """Bit-exact agreement with NumPy, for ops where both should be exact.
 
     Only applied to ops tagged "exact": add, multiply, divide, comparisons,
@@ -127,7 +193,7 @@ def check_numpy_semantics(mx, op, arrays_mx, arrays_np, dtype_name):
     if op.numpy is None or "exact" not in op.tags:
         return []
     try:
-        got = _to_numpy(mx, _apply(mx, op, *arrays_mx))
+        got = _to_numpy(be, _apply(be, op, *arrays_lib))
     except Exception:
         return []
     with np.errstate(all="ignore"):
@@ -161,7 +227,7 @@ def check_numpy_semantics(mx, op, arrays_mx, arrays_np, dtype_name):
     ]
 
 
-def check_ulp(mx, op, arr_mx, arr_np, dtype_name, ndtype=None, *, budget=None):
+def check_ulp(be, op, arr_lib, arr_np, dtype_name, ndtype=None, *, budget=None):
     """Accuracy against the exactly-rounded value, in ULP.
 
     `budget` defaults to what the op is actually expected to deliver: half a ULP
@@ -173,7 +239,7 @@ def check_ulp(mx, op, arr_mx, arr_np, dtype_name, ndtype=None, *, budget=None):
     if budget is None:
         budget = budget_for(op.exact_key)
     try:
-        got = _to_numpy(mx, _apply(mx, op, arr_mx))
+        got = _to_numpy(be, _apply(be, op, arr_lib))
     except Exception:
         return []
     err = ulp_error(got, arr_np, EXACT[op.exact_key], ndtype)
@@ -227,21 +293,23 @@ def check_ulp(mx, op, arr_mx, arr_np, dtype_name, ndtype=None, *, budget=None):
 DIVMOD_RECON_ULP = 4.0
 
 
-def check_divmod_identity(mx, a_mx, b_mx, a_np, b_np, dtype_name):
+def check_divmod_identity(be, a_lib, b_lib, a_np, b_np, dtype_name):
     """divmod must satisfy q*b + r == a, and agree with floor_divide/remainder.
 
     This is the invariant that has to hold no matter which division convention
     the library picks, so it is a fair check even without an oracle.
     """
     findings = []
+    if be.divmod is None:
+        return findings
     try:
-        q, r = mx.divmod(a_mx, b_mx)
-        fd = mx.floor_divide(a_mx, b_mx)
-        rem = mx.remainder(a_mx, b_mx)
-        mx.eval(q, r, fd, rem)
+        q, r = be.divmod(a_lib, b_lib)
+        fd = be.ops["floor_divide"].fn(a_lib, b_lib)
+        rem = be.ops["remainder"].fn(a_lib, b_lib)
+        be.evaluate(q, r, fd, rem)
     except Exception:
         return findings
-    q_n, r_n = _to_numpy(mx, q), _to_numpy(mx, r)
+    q_n, r_n = _to_numpy(be, q), _to_numpy(be, r)
     finite = np.isfinite(a_np) & np.isfinite(b_np) & (b_np != 0)
 
     if a_np.dtype.kind in "iub":
@@ -281,7 +349,7 @@ def check_divmod_identity(mx, a_mx, b_mx, a_np, b_np, dtype_name):
                     f"-> {recon.reshape(-1)[bad]!r}",
                     repr(a_np.reshape(-1)[bad])))
 
-    fd_n = _to_numpy(mx, fd)
+    fd_n = _to_numpy(be, fd)
     ok = ~finite | (q_n.astype(np.float64) == fd_n.astype(np.float64))
     if not np.all(ok):
         bad = int(np.argmin(ok))
@@ -294,9 +362,9 @@ def check_divmod_identity(mx, a_mx, b_mx, a_np, b_np, dtype_name):
     return findings
 
 
-def _apply(mx, op, *arrays):
-    out = op.mlx(*arrays)
-    mx.eval(out)
+def _apply(be, op, *arrays):
+    out = op.fn(*arrays)
+    be.evaluate(out)
     return out
 
 

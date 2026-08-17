@@ -148,6 +148,29 @@ MLX_KNOWN = [
         ref="https://github.com/ml-explore/mlx/issues/4163",
     ),
     Known(
+        check="size-invariance",
+        op=(
+            "arctan", "arctan2", "cosh", "erf", "expm1", "log", "log1p",
+            "logaddexp", "rsqrt", "sinh", "tan", "tanh",
+        ),
+        reason=(
+            "The same #4163 split seen on the length axis instead of the layout "
+            "axis. #4163 names the contiguous residual directly as one of the two "
+            "paths, and a short array is nothing but residual, so this is that "
+            "bug rather than a second one."
+        ),
+        ref="https://github.com/ml-explore/mlx/issues/4163",
+    ),
+    Known(
+        check="size-invariance",
+        op="power",
+        reason=(
+            "Same as the #4162 layout entry: a short array does not reach "
+            "Accelerate's vectorized pow and falls back to scalar std::pow."
+        ),
+        ref="https://github.com/ml-explore/mlx/issues/4162",
+    ),
+    Known(
         check="ulp",
         op=("sin", "cos", "exp"),
         dtype="float64",
@@ -159,6 +182,139 @@ MLX_KNOWN = [
         ref="https://github.com/ml-explore/mlx/issues/4158",
     ),
 ]
+
+
+# Ops whose vectorized kernel is Sleef and whose scalar kernel is libm. The two
+# agree to about a ULP but not bit for bit, so every layout and length check
+# fires on them. Kept as one list because it is one root cause.
+_TORCH_SLEEF_OPS = (
+    "exp",
+    "expm1",
+    "log",
+    "log1p",
+    "sin",
+    "cos",
+    "tan",
+    "tanh",
+    "sinh",
+    "cosh",
+    "arctan",
+    "arctan2",
+    "logaddexp",
+    "power",
+    "erf",
+    "sqrt",
+    "rsqrt",
+    "reciprocal",
+)
+
+TORCH_KNOWN = [
+    Known(
+        check="layout-invariance",
+        op=_TORCH_SLEEF_OPS,
+        reason=(
+            "The vectorized kernel calls Sleef and the scalar tail calls libm, "
+            "so a non-contiguous input that falls back to the scalar path can "
+            "differ in the last bit. Torch documents that results are not "
+            "bitwise identical across vectorization, so this is expected rather "
+            "than a bug. Reported only when the difference is more than "
+            "rounding, which is what #193753 and #193754 are."
+        ),
+        ref="https://pytorch.org/docs/stable/notes/numerical_accuracy.html",
+    ),
+    Known(
+        check="size-invariance",
+        op=_TORCH_SLEEF_OPS,
+        reason=(
+            "Same root cause as the layout entry above: array length decides "
+            "whether Sleef or libm runs, and the two differ in the last bit."
+        ),
+        ref="https://pytorch.org/docs/stable/notes/numerical_accuracy.html",
+    ),
+    Known(
+        check="numpy-semantics",
+        op="sign",
+        reason=(
+            "sign(nan) returns 0 rather than propagating, because the kernel is "
+            "(0 < x) - (x < 0) and both comparisons are false for NaN. Open as "
+            "#41245 since 2020 and again as #187295. PR #187558 fixed it across "
+            "CPU, CUDA and Inductor and was closed unmerged, so this is known "
+            "and unfixed rather than new."
+        ),
+        ref="https://github.com/pytorch/pytorch/issues/187295",
+    ),
+    Known(
+        check="numpy-semantics",
+        op="remainder",
+        dtype=FLOATS,
+        reason=(
+            "Two separate causes, both filed. A zero remainder keeps the sign of "
+            "the dividend instead of the divisor, because the sign fixup is "
+            "guarded on the remainder being nonzero: filed as #193755. And the "
+            "vectorized Sleef_fmod returns NaN once the division overflows, "
+            "where libm returns a finite value: filed as #193753."
+        ),
+        ref="https://github.com/pytorch/pytorch/issues/193755",
+    ),
+    Known(
+        check="size-invariance",
+        op="remainder",
+        dtype=FLOATS,
+        reason=(
+            "Sleef_fmod is undefined once abs(a / b) reaches 1e300 for double or "
+            "1e38 for float, so a long array gets NaN and a short one gets the "
+            "right answer. Diagnosed on #77742, which was closed by a fix that "
+            "only covered div with rounding_mode='floor'. Filed as #193753."
+        ),
+        ref="https://github.com/pytorch/pytorch/issues/193753",
+    ),
+    Known(
+        check="layout-invariance",
+        op="remainder",
+        dtype=FLOATS,
+        reason=(
+            "Same Sleef_fmod overflow as the size entry above, reached the other "
+            "way: a strided input falls back to the scalar libm path and gets "
+            "the right answer, while the contiguous one gets NaN. Filed as "
+            "#193753."
+        ),
+        ref="https://github.com/pytorch/pytorch/issues/193753",
+    ),
+    Known(
+        check="size-invariance",
+        op=("floor_divide", "divmod"),
+        dtype=("float16", "bfloat16"),
+        reason=(
+            "div_floor_floating_vec computes in Vectorized<Half>, so fmod and "
+            "the division round to 8 or 11 mantissa bits at each step, while "
+            "the scalar path promotes to float32. The vectorized result can "
+            "exceed the quotient it is meant to floor: bfloat16 560 // 3 gives "
+            "187. Filed as #193754."
+        ),
+        ref="https://github.com/pytorch/pytorch/issues/193754",
+    ),
+    Known(
+        check="numpy-semantics",
+        op="floor_divide",
+        dtype=("float16", "bfloat16"),
+        reason=(
+            "Same reduced-precision vectorized path as the size-invariance "
+            "entry above. Filed as #193754."
+        ),
+        ref="https://github.com/pytorch/pytorch/issues/193754",
+    ),
+]
+
+
+# Each library gets its own list. A shared list would let an MLX ruling suppress
+# a real torch bug that happens to be the same op and dtype.
+KNOWN = {"mlx": MLX_KNOWN, "torch": TORCH_KNOWN}
+
+
+def known_for(backend_name):
+    """Empty for a library with no list yet, so its findings all read as new
+    rather than being silently matched against another library's rulings."""
+    return KNOWN.get(backend_name, [])
 
 
 def partition(findings, known=None):

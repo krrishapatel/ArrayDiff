@@ -1,4 +1,9 @@
-"""The op table: how to call each op in MLX and in NumPy.
+"""The op table: how to call each op in the library under test, and in NumPy.
+
+There is one spec list, not one per library. Two tables drift: an op added for
+MLX and forgotten for Torch silently reduces coverage without failing anything.
+Instead each spec names the op, and a library that spells it differently gets an
+entry in that library's name map.
 
 `domain` restricts inputs where the op is only defined on part of the line, so
 that a NaN-vs-NaN comparison does not stand in for a real check.
@@ -16,12 +21,24 @@ import numpy as np
 class Op:
     name: str
     arity: int
-    mlx: Callable
+    fn: Callable  # the op in the library under test
     numpy: Callable
     # Restrict the input domain, e.g. positives only for log.
     domain: Callable[[np.ndarray], np.ndarray] | None = None
     # Second-argument domain for binary ops, e.g. no zero divisors.
     domain_b: Callable[[np.ndarray], np.ndarray] | None = None
+    kinds: tuple[str, ...] = ("f",)
+    exact_key: str | None = None
+    tags: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class Spec:
+    name: str
+    arity: int
+    numpy: Callable | None
+    domain: Callable | None = None
+    domain_b: Callable | None = None
     kinds: tuple[str, ...] = ("f",)
     exact_key: str | None = None
     tags: tuple[str, ...] = field(default_factory=tuple)
@@ -37,57 +54,84 @@ def nonzero(x):
     return out
 
 
+SPECS = [
+    # --- unary, exact or near-exact ---
+    Spec("negative", 1, np.negative, kinds=("f", "i"), tags=("exact",)),
+    Spec("abs", 1, np.abs, kinds=("f", "i"), tags=("exact",)),
+    Spec("sign", 1, np.sign, kinds=("f", "i"), tags=("exact",)),
+    Spec("floor", 1, np.floor, tags=("exact",)),
+    Spec("ceil", 1, np.ceil, tags=("exact",)),
+    Spec("square", 1, np.square, exact_key="square", tags=("exact",)),
+    Spec("sqrt", 1, np.sqrt, domain=positive, exact_key="sqrt", tags=("exact",)),
+    Spec("reciprocal", 1, np.reciprocal, domain=nonzero, exact_key="reciprocal",
+         tags=("exact",)),
+    Spec("rsqrt", 1, lambda x: 1.0 / np.sqrt(x), domain=positive,
+         exact_key="rsqrt"),
+    # --- unary transcendentals, judged by ULP not bit equality ---
+    Spec("exp", 1, np.exp, exact_key="exp"),
+    Spec("log", 1, np.log, domain=positive, exact_key="log"),
+    Spec("log1p", 1, np.log1p, domain=positive, exact_key="log1p"),
+    Spec("expm1", 1, np.expm1, exact_key="expm1"),
+    Spec("sin", 1, np.sin, exact_key="sin"),
+    Spec("cos", 1, np.cos, exact_key="cos"),
+    Spec("tan", 1, np.tan, exact_key="tan"),
+    Spec("tanh", 1, np.tanh, exact_key="tanh"),
+    Spec("sinh", 1, np.sinh, exact_key="sinh"),
+    Spec("cosh", 1, np.cosh, exact_key="cosh"),
+    Spec("arctan", 1, np.arctan, exact_key="arctan"),
+    Spec("erf", 1, None),
+    Spec("logical_not", 1, np.logical_not, kinds=("f", "i")),
+    # --- binary ---
+    Spec("add", 2, np.add, kinds=("f", "i"), tags=("exact",)),
+    Spec("subtract", 2, np.subtract, kinds=("f", "i"), tags=("exact",)),
+    Spec("multiply", 2, np.multiply, kinds=("f", "i"), tags=("exact",)),
+    Spec("divide", 2, np.divide, domain_b=nonzero, tags=("exact",)),
+    Spec("maximum", 2, np.maximum, kinds=("f", "i"), tags=("exact",)),
+    Spec("minimum", 2, np.minimum, kinds=("f", "i"), tags=("exact",)),
+    Spec("power", 2, np.power, domain=positive),
+    Spec("remainder", 2, np.remainder, domain_b=nonzero, kinds=("f", "i"),
+         tags=("exact",)),
+    Spec("floor_divide", 2, np.floor_divide, domain_b=nonzero, kinds=("f", "i"),
+         tags=("exact",)),
+    Spec("arctan2", 2, np.arctan2),
+    Spec("logaddexp", 2, np.logaddexp),
+    # --- comparisons, must be exactly right ---
+    Spec("equal", 2, np.equal, kinds=("f", "i"), tags=("exact",)),
+    Spec("less", 2, np.less, kinds=("f", "i"), tags=("exact",)),
+    Spec("greater", 2, np.greater, kinds=("f", "i"), tags=("exact",)),
+    Spec("less_equal", 2, np.less_equal, kinds=("f", "i"), tags=("exact",)),
+]
+
+# Where a library spells an op differently. `torch.equal` is the trap: it reduces
+# the whole tensor to one bool rather than comparing elementwise, so using it
+# would make every comparison check silently vacuous.
+TORCH_NAMES = {"power": "pow", "equal": "eq"}
+
+
+def _build(lib, names):
+    ops = {}
+    for s in SPECS:
+        fn = getattr(lib, names.get(s.name, s.name), None)
+        if fn is None:
+            continue
+        ops[s.name] = Op(
+            name=s.name,
+            arity=s.arity,
+            fn=fn,
+            numpy=s.numpy,
+            domain=s.domain,
+            domain_b=s.domain_b,
+            kinds=s.kinds,
+            exact_key=s.exact_key,
+            tags=s.tags,
+        )
+    return ops
+
+
 def build_ops(mx):
-    """Built lazily so importing this module does not require MLX."""
-    ops = [
-        # --- unary, exact or near-exact ---
-        Op("negative", 1, mx.negative, np.negative, kinds=("f", "i"), tags=("exact",)),
-        Op("abs", 1, mx.abs, np.abs, kinds=("f", "i"), tags=("exact",)),
-        Op("sign", 1, mx.sign, np.sign, kinds=("f", "i"), tags=("exact",)),
-        Op("floor", 1, mx.floor, np.floor, tags=("exact",)),
-        Op("ceil", 1, mx.ceil, np.ceil, tags=("exact",)),
-        Op("square", 1, mx.square, np.square, exact_key="square", tags=("exact",)),
-        Op("sqrt", 1, mx.sqrt, np.sqrt, domain=positive, exact_key="sqrt",
-           tags=("exact",)),
-        Op("reciprocal", 1, mx.reciprocal, np.reciprocal, domain=nonzero,
-           exact_key="reciprocal", tags=("exact",)),
-        Op("rsqrt", 1, mx.rsqrt, lambda x: 1.0 / np.sqrt(x), domain=positive,
-           exact_key="rsqrt"),
-        # --- unary transcendentals, judged by ULP not bit equality ---
-        Op("exp", 1, mx.exp, np.exp, exact_key="exp"),
-        Op("log", 1, mx.log, np.log, domain=positive, exact_key="log"),
-        Op("log1p", 1, mx.log1p, np.log1p, domain=positive, exact_key="log1p"),
-        Op("expm1", 1, mx.expm1, np.expm1, exact_key="expm1"),
-        Op("sin", 1, mx.sin, np.sin, exact_key="sin"),
-        Op("cos", 1, mx.cos, np.cos, exact_key="cos"),
-        Op("tan", 1, mx.tan, np.tan, exact_key="tan"),
-        Op("tanh", 1, mx.tanh, np.tanh, exact_key="tanh"),
-        Op("sinh", 1, mx.sinh, np.sinh, exact_key="sinh"),
-        Op("cosh", 1, mx.cosh, np.cosh, exact_key="cosh"),
-        Op("arctan", 1, mx.arctan, np.arctan, exact_key="arctan"),
-        Op("erf", 1, mx.erf, None),
-        Op("logical_not", 1, mx.logical_not, np.logical_not, kinds=("f", "i")),
-        # --- binary ---
-        Op("add", 2, mx.add, np.add, kinds=("f", "i"), tags=("exact",)),
-        Op("subtract", 2, mx.subtract, np.subtract, kinds=("f", "i"),
-           tags=("exact",)),
-        Op("multiply", 2, mx.multiply, np.multiply, kinds=("f", "i"),
-           tags=("exact",)),
-        Op("divide", 2, mx.divide, np.divide, domain_b=nonzero, tags=("exact",)),
-        Op("maximum", 2, mx.maximum, np.maximum, kinds=("f", "i"), tags=("exact",)),
-        Op("minimum", 2, mx.minimum, np.minimum, kinds=("f", "i"), tags=("exact",)),
-        Op("power", 2, mx.power, np.power, domain=positive),
-        Op("remainder", 2, mx.remainder, np.remainder, domain_b=nonzero,
-           kinds=("f", "i"), tags=("exact",)),
-        Op("floor_divide", 2, mx.floor_divide, np.floor_divide, domain_b=nonzero,
-           kinds=("f", "i"), tags=("exact",)),
-        Op("arctan2", 2, mx.arctan2, np.arctan2),
-        Op("logaddexp", 2, mx.logaddexp, np.logaddexp),
-        # --- comparisons, must be exactly right ---
-        Op("equal", 2, mx.equal, np.equal, kinds=("f", "i"), tags=("exact",)),
-        Op("less", 2, mx.less, np.less, kinds=("f", "i"), tags=("exact",)),
-        Op("greater", 2, mx.greater, np.greater, kinds=("f", "i"), tags=("exact",)),
-        Op("less_equal", 2, mx.less_equal, np.less_equal, kinds=("f", "i"),
-           tags=("exact",)),
-    ]
-    return {op.name: op for op in ops if op.mlx is not None}
+    """MLX. Built lazily so importing this module does not require MLX."""
+    return _build(mx, {})
+
+
+def build_torch_ops(torch):
+    return _build(torch, TORCH_NAMES)

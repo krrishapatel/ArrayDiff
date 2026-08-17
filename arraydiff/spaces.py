@@ -66,10 +66,14 @@ def int_values(dtype: np.dtype, *, rng: np.random.Generator, n_random: int = 128
     return np.array(vals, dtype=dtype)
 
 
-# Layouts. Each takes a 1-D reference array and returns (mlx_array, numpy_array)
-# holding the SAME logical values reached through a different memory layout.
-# Any op whose result depends on which of these it got is a bug: the layout
-# carries no numerical information.
+# Layouts. Each takes a backend and a 1-D reference array, and returns
+# (native_array, numpy_array) holding the SAME logical values reached through a
+# different memory layout. Any op whose result depends on which of these it got
+# is a bug: the layout carries no numerical information.
+#
+# Not every backend can express every layout. Torch has no negative strides, so
+# `reversed` does not exist there; `Backend.layouts` says which are available
+# rather than substituting a copy and comparing a value against itself.
 
 
 def _pad(values: np.ndarray, factor: int) -> np.ndarray:
@@ -91,30 +95,30 @@ def layout(name):
 
 
 @layout("contiguous")
-def _contiguous(mx, values, dtype=None):
-    return mx.array(values, dtype=dtype), values
+def _contiguous(be, values, dtype=None):
+    return be.array(values, dtype=dtype), values
 
 
 @layout("strided")
-def _strided(mx, values, dtype=None):
+def _strided(be, values, dtype=None):
     padded = _pad(values, 2)
-    return mx.array(padded, dtype=dtype)[::2], padded[::2]
+    return be.array(padded, dtype=dtype)[::2], padded[::2]
 
 
 @layout("strided3")
-def _strided3(mx, values, dtype=None):
+def _strided3(be, values, dtype=None):
     padded = _pad(values, 3)
-    return mx.array(padded, dtype=dtype)[::3], padded[::3]
+    return be.array(padded, dtype=dtype)[::3], padded[::3]
 
 
 @layout("reversed")
-def _reversed(mx, values, dtype=None):
+def _reversed(be, values, dtype=None):
     flipped = values[::-1].copy()
-    return mx.array(flipped, dtype=dtype)[::-1], flipped[::-1]
+    return be.array(flipped, dtype=dtype)[::-1], flipped[::-1]
 
 
 @layout("transposed")
-def _transposed(mx, values, dtype=None):
+def _transposed(be, values, dtype=None):
     """A transposed view, reading back in the original order.
 
     The values go in row 0 of a (3, n) grid, so after the transpose column 0 of
@@ -126,32 +130,32 @@ def _transposed(mx, values, dtype=None):
     grid = np.zeros((3, n), dtype=values.dtype)
     grid[0] = values
     return (
-        mx.array(grid, dtype=dtype).T[:, 0],
+        be.array(grid, dtype=dtype).T[:, 0],
         grid.T[:, 0],
     )
 
 
 @layout("column")
-def _column(mx, values, dtype=None):
+def _column(be, values, dtype=None):
     # A column of a 2-D array: non-contiguous, original order.
     n = len(values)
     grid = np.zeros((n, 3), dtype=values.dtype)
     grid[:, 0] = values
-    return mx.array(grid, dtype=dtype)[:, 0], grid[:, 0]
+    return be.array(grid, dtype=dtype)[:, 0], grid[:, 0]
 
 
 @layout("offset")
-def _offset(mx, values, dtype=None):
+def _offset(be, values, dtype=None):
     # A slice that does not start at element zero.
     padded = np.concatenate([np.zeros(3, dtype=values.dtype), values])
-    return mx.array(padded, dtype=dtype)[3:], padded[3:]
+    return be.array(padded, dtype=dtype)[3:], padded[3:]
 
 
 @layout("broadcast")
-def _broadcast(mx, values, dtype=None):
+def _broadcast(be, values, dtype=None):
     # Broadcasting a length-1 axis gives a zero-stride view.
     col = values.reshape(-1, 1)
     return (
-        mx.broadcast_to(mx.array(col, dtype=dtype), (len(values), 2))[:, 0],
+        be.broadcast_to(be.array(col, dtype=dtype), (len(values), 2))[:, 0],
         np.broadcast_to(col, (len(values), 2))[:, 0],
     )
