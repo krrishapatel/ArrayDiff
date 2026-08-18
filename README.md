@@ -346,14 +346,24 @@ libraries until the operand pairing was fixed.
 
 Writing the test for that fix turned up the last two entries, and they are the
 more interesting pair, because the oracle is what is wrong. **NumPy's `minimum`
-and `maximum` are not sign aware in float16.** The float16 loop returns the first
-argument, so `np.minimum(float16(0.0), float16(-0.0))` is `0.0` while the float32
-and float64 loops both give `-0.0`. IEEE 754, `std::fmin` and `vminq_f32` all
-agree with the wider loops, so a library that returns `-0.0` in float16 is correct
-and the disagreement belongs to NumPy. `numpy-semantics` therefore scopes the
-`#193781` attribution to the dtypes where NumPy can be trusted on this, and
-float16 gets its own entry pointing at NumPy. Getting that split wrong is how a
-tool starts filing an oracle's bug against the library under test.
+and `maximum` are not sign aware on a pair of zeros, and which dtypes that
+affects depends on the ISA.** They return whichever operand a comparison reached
+first, so `np.minimum(float16(0.0), float16(-0.0))` is `0.0`. float32 and float64
+substitute an instruction for that comparison: `FMIN`/`FMAX` on aarch64, which
+are sign-aware, and `MINSS`/`MAXSS` on x86, which return the second operand and
+are therefore order-dependent too. float16 has no override on any machine. IEEE
+754, `std::fmin` and `vminq_f32` all give `-0.0` for the minimum in either
+argument order, so a library that does the same is correct and the disagreement
+belongs to NumPy. `numpy-semantics` scopes the `#193781` attribution to the
+dtypes where NumPy can be trusted here, and the rest get an entry pointing at
+NumPy. Getting that split wrong is how a tool starts filing an oracle's bug
+against the library under test.
+
+That split is **probed at import rather than written down**, and it is worth
+saying why, because this project got it wrong first. It was a hardcoded
+`("float32", "float64", "bfloat16")`, which passes on Apple Silicon and fails on
+x86 Linux. CI caught it on the first run. A cross-platform differential tester
+that hardcodes one platform's answer is the same mistake it exists to find.
 
 **`fmod` and `remainder` return NaN where the scalar path returns the right
 answer.** `Sleef_fmod` is documented as undefined once `abs(a / b)` reaches

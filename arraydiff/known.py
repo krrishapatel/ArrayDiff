@@ -21,11 +21,37 @@ import numpy as np
 FLOATS = ("float16", "float32", "float64", "bfloat16")
 INTS = ("int8", "int16", "int32", "int64", "uint8", "uint32")
 
-# The dtypes where NumPy's own min/max are sign-aware on zeros, so a disagreement
-# with them is the library's rather than the oracle's. Its float16 loop returns
-# the first argument instead. bfloat16 belongs here because it has no NumPy dtype
-# and its reference is computed in float32.
-NUMPY_SIGN_AWARE_FLOATS = ("float32", "float64", "bfloat16")
+def _numpy_minmax_is_sign_aware(dtype: str) -> bool:
+    """Whether NumPy's own min/max pick a zero's sign in this dtype, here.
+
+    Probed rather than written down, because the answer depends on the machine.
+    NumPy's float32 and float64 loops replace their scalar macro with an ISA
+    instruction: aarch64 uses FMIN/FMAX, which are sign-aware, and x86 uses
+    MINSS/MAXSS, which return the second operand and so are order-dependent.
+    The plain C fallback returns the first operand. float16 has no such override
+    and always takes the C path.
+
+    So a hardcoded list of sign-aware dtypes is right on one host and wrong on
+    another. CI caught exactly that: a list naming float32 held on Apple Silicon
+    and failed on x86 Linux.
+    """
+    # bfloat16 has no NumPy dtype, so its reference is computed in float32 and
+    # that is the loop whose behaviour decides this.
+    probe = np.float32 if dtype == "bfloat16" else getattr(np, dtype)
+    zero, negzero = probe(0.0), probe(-0.0)
+    return bool(
+        np.signbit(np.minimum(zero, negzero))
+        and np.signbit(np.minimum(negzero, zero))
+        and not np.signbit(np.maximum(zero, negzero))
+        and not np.signbit(np.maximum(negzero, zero))
+    )
+
+
+# Where NumPy is a usable oracle for a zero's sign, a disagreement is the
+# library's. Where it is not, the disagreement is NumPy's and says nothing about
+# the library under test.
+NUMPY_SIGN_AWARE_FLOATS = tuple(f for f in FLOATS if _numpy_minmax_is_sign_aware(f))
+NUMPY_SIGN_BLIND_FLOATS = tuple(f for f in FLOATS if f not in NUMPY_SIGN_AWARE_FLOATS)
 
 
 @dataclass(frozen=True)
@@ -345,16 +371,19 @@ TORCH_KNOWN = [
     Known(
         check="numpy-semantics",
         op=("minimum", "maximum"),
-        dtype=("float16",),
+        dtype=NUMPY_SIGN_BLIND_FLOATS,
         reason=(
-            "NumPy is not a valid oracle for a signed zero in float16. Its "
-            "float16 loop returns the first argument rather than the negative "
-            "zero, so np.minimum(float16(0.0), float16(-0.0)) is 0.0 while the "
-            "float32 and float64 loops both give -0.0. IEEE 754 minimum and "
-            "maximum, std::fmin/std::fmax and vminq_f32 all agree with the wider "
-            "loops, so a library that gives -0.0 in float16 is right and the "
-            "disagreement is NumPy's. Only float16: bfloat16 has no NumPy dtype "
-            "here, so its reference is computed in float32, which is sign-aware."
+            "NumPy is not a valid oracle for a signed zero in these dtypes on "
+            "this machine, so a disagreement is NumPy's rather than the "
+            "library's. Its min/max return whichever operand a comparison "
+            "reached first, and which dtypes that affects is ISA dependent: the "
+            "float32 and float64 loops swap in FMIN/FMAX on aarch64, which are "
+            "sign-aware, and MINSS/MAXSS on x86, which return the second "
+            "operand, while float16 has no override anywhere. IEEE 754 minimum "
+            "and maximum, std::fmin/std::fmax and vminq_f32 all give -0.0 for "
+            "the minimum in either argument order, so a library that does the "
+            "same is right. The dtype list is probed at import, not written "
+            "down, because a fixed list is wrong on half the machines."
         ),
         ref="https://numpy.org/doc/stable/reference/generated/numpy.minimum.html",
     ),

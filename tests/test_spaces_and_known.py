@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from arraydiff import known
 from arraydiff.checks import Finding
 from arraydiff.known import Known, partition
 from arraydiff.spaces import LAYOUTS, SPECIAL_FLOATS, float_values, int_values
@@ -133,25 +134,45 @@ class TestKnownSuppression:
         assert not under(Finding("ulp", "exp", "float64", "d", (-800.0,), "g", "w"))
 
     def test_numpy_is_not_a_sign_aware_oracle_in_float16(self):
-        """The fact the float16 min/max entry rests on.
+        """The fact the min/max oracle entry rests on.
 
-        NumPy's float16 loop returns the first argument for a pair of zeros,
-        while its float32 and float64 loops return the negative zero. So a
-        library that is right by IEEE 754 disagrees with NumPy in float16 only,
-        and `numpy-semantics` has to attribute that to the oracle rather than to
-        the library. If NumPy ever fixes this, this test fails and the entry
+        NumPy's float16 min/max return whichever argument came first for a pair
+        of zeros, so a library that is right by IEEE 754 disagrees with NumPy
+        there, and `numpy-semantics` has to blame the oracle rather than the
+        library. float16 is the case that holds on every machine: it has no
+        ISA-specific override, unlike float32 and float64, so it always takes
+        the sign-blind C path. If NumPy ever fixes it, this fails and the entry
         should be deleted rather than kept as a permanent excuse.
         """
         for op in (np.minimum, np.maximum):
-            for wide in (np.float32, np.float64):
-                assert np.signbit(op(wide(0.0), wide(-0.0))) == np.signbit(
-                    op(wide(-0.0), wide(0.0))
-                ), f"{op.__name__} in {wide.__name__} should be order independent"
             first = op(np.float16(0.0), np.float16(-0.0))
             second = op(np.float16(-0.0), np.float16(0.0))
             assert np.signbit(first) != np.signbit(second), (
                 f"np.{op.__name__} in float16 is order independent now, so the "
                 "float16 known entry is obsolete"
+            )
+        assert "float16" in known.NUMPY_SIGN_BLIND_FLOATS
+
+    def test_the_oracle_split_is_probed_not_assumed(self):
+        """The regression guard for a genuine portability bug in this file.
+
+        The sign-aware dtypes used to be a hardcoded ("float32", "float64",
+        "bfloat16"). That is true on aarch64, where NumPy's wide loops use
+        FMIN/FMAX, and false on x86, where they use MINSS/MAXSS and return the
+        second operand. CI on x86 Linux failed on it. So the split has to be
+        measured on the host, and the two halves have to stay complementary.
+        """
+        aware = set(known.NUMPY_SIGN_AWARE_FLOATS)
+        blind = set(known.NUMPY_SIGN_BLIND_FLOATS)
+        assert aware.isdisjoint(blind)
+        assert aware | blind == set(known.FLOATS)
+        for dtype in known.FLOATS:
+            probe = np.float32 if dtype == "bfloat16" else getattr(np, dtype)
+            order_independent = np.signbit(
+                np.minimum(probe(0.0), probe(-0.0))
+            ) == np.signbit(np.minimum(probe(-0.0), probe(0.0)))
+            assert (dtype in aware) == bool(order_independent), (
+                f"{dtype} is on the wrong side of the split"
             )
 
     def test_the_float16_entry_does_not_swallow_the_wider_dtypes(self):
