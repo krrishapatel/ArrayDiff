@@ -191,13 +191,29 @@ class TestDeviceInvariance:
         assert check_device_invariance(be, op, VALUES, "float64") == ([], None)
 
 
+# NumPy applies its SIMD transcendental loops to contiguous data only, so a
+# reversed view falls back to the scalar loop and can land one ULP away. On
+# aarch64 these agree and the set is empty in practice; on x86 it is not. This
+# is NumPy's own accuracy budget rather than a harness bug, so layout findings
+# on these ops are exempt from the self-check below. Nothing else is.
+NUMPY_MULTI_PATH_OPS = frozenset({
+    "arctan", "arctan2", "cosh", "exp", "expm1",
+    "log", "log1p", "power", "sinh", "tan",
+})
+
+
 class TestAgainstNumpyItself:
     """Run the whole sweep against NumPy through the backend adapter.
 
     NumPy is what the oracle-based checks compare to, so it has to come back
-    clean. Anything reported here is a bug in a check, and it covers the
-    oracle-free checks too: NumPy has one code path per op, so any layout or
-    length difference reported against it would be the harness inventing one.
+    clean, and anything reported here is a bug in a check.
+
+    This used to claim the oracle-free checks were covered too, on the grounds
+    that NumPy has one code path per op. That is false: its transcendentals are
+    vectorized for contiguous data only, so NumPy is genuinely not
+    layout-invariant to the last ULP. The exemption below is narrow, and the
+    test after it measures the bound the exemption rests on instead of trusting
+    it.
     """
 
     def test_the_sweep_reports_nothing(self):
@@ -205,4 +221,40 @@ class TestAgainstNumpyItself:
 
         with np.errstate(all="ignore"):
             found = run(NUMPY, n_random=64)
-        assert found == [], f"a check flags NumPy: {found[:3]}"
+        unexpected = [
+            f
+            for f in found
+            if not (
+                f.check == "layout-invariance" and f.op in NUMPY_MULTI_PATH_OPS
+            )
+        ]
+        assert unexpected == [], f"a check flags NumPy: {unexpected[:3]}"
+
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    def test_numpys_own_layout_differences_stay_within_one_ulp(self, dtype):
+        """The bound the exemption rests on.
+
+        If NumPy's contiguous and strided paths ever drift further than a ULP,
+        the exemption is hiding something and should be reconsidered rather than
+        widened. Written against NumPy directly so it measures NumPy and not
+        this harness.
+        """
+        rng = np.random.default_rng(0)
+        values = rng.uniform(0.5, 2.0, size=256).astype(dtype)
+        other = rng.uniform(0.5, 2.0, size=256).astype(dtype)
+        as_int = np.int32 if dtype is np.float32 else np.int64
+        unary = ["arctan", "cosh", "exp", "expm1", "log", "log1p", "sinh", "tan"]
+        with np.errstate(all="ignore"):
+            for name in unary + ["arctan2", "power"]:
+                op = getattr(np, name)
+                if name in ("arctan2", "power"):
+                    contiguous = op(values, other)
+                    strided = op(values[::-1], other[::-1])[::-1]
+                else:
+                    contiguous = op(values)
+                    strided = op(values[::-1])[::-1]
+                gap = np.abs(contiguous.view(as_int) - strided.view(as_int))
+                assert gap.max() <= 1, (
+                    f"np.{name} in {np.dtype(dtype).name} differs by "
+                    f"{gap.max()} ULP between layouts"
+                )
