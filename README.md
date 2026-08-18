@@ -1,5 +1,7 @@
 # arraydiff
 
+[![CI](https://github.com/krrishapatel/ArrayDiff/actions/workflows/ci.yml/badge.svg)](https://github.com/krrishapatel/ArrayDiff/actions/workflows/ci.yml)
+
 Differential numerical testing for array libraries. It looks for places where an
 elementwise op returns the wrong answer, an inconsistent answer, or an answer
 that depends on something it should not depend on.
