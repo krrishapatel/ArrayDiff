@@ -95,7 +95,6 @@ def check_layout_invariance(
             for got, want in zip(arr_nps, ref_nps)
         ):
             continue  # layout helper changed the values; skip rather than lie
-        arr_np, ref_np = arr_nps[0], ref_nps[0]
         try:
             out = _to_numpy(be, _apply(be, op, *arrs))
         except Exception:
