@@ -160,12 +160,17 @@ arraydiff --backend jax
 ```
 
 Exit status is 1 when there are findings, so it can gate CI. This repo's own CI
-runs the sweep against real torch and jax builds on every push: it asserts the
-NumPy oracle reports nothing, that every torch and jax finding is already in
-`known.py`, and that the specific filed bugs below still reproduce, so the day
-one is fixed upstream the run goes red instead of the counts here going stale.
-The GPU half of the torch table needs a second device, so it is checked on Apple
-Silicon locally and skipped on the x86 CI runner.
+runs the sweep against real torch and jax builds on every push and asserts that
+the specific filed bugs below still reproduce, so the day one is fixed upstream
+the run goes red instead of the counts here going stale. It does not assert a
+zero-new count, because that count is platform-dependent: NumPy runs its
+transcendental SIMD loops on contiguous data only, so on x86 a reversed view
+lands about 1 ULP away where aarch64 is bit-identical, and torch's CPU `sqrt` is
+similarly off by under a ULP on x86. Those are rounding, handled by the ULP
+tolerance in `tests/test_checks.py`, not defects. The bugs the job pins are all
+categorical, sign, or self-contradiction errors, which reproduce on any
+architecture. The GPU half of the torch table needs a second device, so it is
+checked on Apple Silicon locally and skipped on the x86 CI runner.
 
 ```python
 from arraydiff.backends import mlx_backend

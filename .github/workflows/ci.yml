@@ -20,7 +20,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: pytest -q
+      # The sweep tests need real torch/jax and run in the `sweep` job below.
+      - run: pytest -q -m "not sweep"
 
   lint:
     name: Lint
@@ -57,4 +58,4 @@ jobs:
       # purpose.
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: pip install "jax[cpu]"
-      - run: pytest -q tests/test_sweep_ci.py
+      - run: pytest -q -m sweep
