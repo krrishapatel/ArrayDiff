@@ -173,11 +173,16 @@ new, already_known = partition(run(be), known_for(be.name))
 
 ## Status
 
-Three libraries. `known.py` accounts for everything already settled, so the new
-count below is only the part that is not, and every line of it is attributed to a
-cause before it is called a finding. Nothing new is being filed at the moment.
-Everything already open across these projects is waiting on a maintainer, and
-adding to that pile is not what makes any of it get read.
+Four libraries, three of them under test and NumPy mostly serving as the oracle.
+`known.py` accounts for everything already settled, so the new count below is
+only the part that is not, and every line of it is attributed to a cause before
+it is called a finding.
+
+Nothing is being filed against MLX, PyTorch or JAX at the moment. Everything
+already open there is waiting on a maintainer, and adding to that pile is not
+what makes any of it get read. The one recent exception is
+[numpy#32341](https://github.com/numpy/numpy/pull/32341), which went to a
+project with nothing else outstanding.
 
 ### MLX
 
@@ -455,9 +460,36 @@ in any one codebase.
 ### NumPy
 
 NumPy is also wired up as a backend, and the sweep against it has to come back
-empty. It is the oracle for `numpy-semantics`, and it has one code path per op,
-so any layout or length difference reported against it would be the harness
-inventing one rather than finding one. `tests/test_checks.py` asserts this.
+almost empty. It is the oracle for `numpy-semantics`, so a disagreement there
+would be the harness contradicting itself rather than finding anything.
+
+The oracle-free checks are a different matter. This section used to say NumPy
+has one code path per op, so any layout difference reported against it had to be
+the harness inventing one. That was wrong, and it was wrong in the direction
+that hides bugs. NumPy applies its transcendental SIMD loops to contiguous data
+only, so a reversed view takes the scalar loop and can land a ULP away. Measured
+on both architectures: 0 ULP on aarch64, 1 on x86 for most of the affected ops,
+2 for `cosh` in float32 on NumPy 2.2. That is NumPy's accuracy budget for ops it
+does not promise to round correctly, not a defect.
+
+So `tests/test_checks.py` exempts `layout-invariance` on ten transcendentals and
+nothing else, and rather than trusting the exemption it measures the gap and
+fails over `MAX_LAYOUT_ULP`. A wrong answer cannot hide under a bound that
+tight, and the untouched half of the assertion is machine independent: rounding
+cannot turn a finite number into a NaN, so the two layouts must at least agree
+on which values are finite.
+
+One real NumPy bug came out of this work, though the sweep did not find it and
+could not have. `maximum` and `minimum` returned a zero whose sign depended on
+the dtype, the argument order and the CPU, so on x86 both
+`np.maximum(0.0, -0.0)` and `np.minimum(0.0, -0.0)` gave `-0.0`. NumPy is the
+oracle here, so nothing that compares against it can see this. It turned up by
+carrying the signed-zero question from
+[#4317](https://github.com/ml-explore/mlx/issues/4317) and
+[#193781](https://github.com/pytorch/pytorch/issues/193781) into a third library
+by hand. Fixed in
+[numpy#32341](https://github.com/numpy/numpy/pull/32341), verified against real
+aarch64 and x86 builds, where the same test class fails 25 times unpatched.
 
 ## Adding a library
 
