@@ -114,6 +114,41 @@ def test_jax_remainder_zero_sign_still_reproduces():
 
 
 @pytest.mark.parametrize(
+    "ref, what",
+    [
+        (
+            "recorded: tensorflow min/max give a zero the wrong sign",
+            "minimum/maximum give a zero result the wrong IEEE sign",
+        ),
+        (
+            "recorded: tensorflow remainder zero-sign",
+            "remainder gives a zero result the sign of the dividend",
+        ),
+        (
+            "recorded: tensorflow floor_divide at infinity",
+            "1.0 // -inf is -0.0 rather than -1.0",
+        ),
+    ],
+)
+def test_recorded_tensorflow_bug_classes_still_reproduce(ref, what):
+    """The three bug classes the README says recur in TensorFlow.
+
+    Only these three are pinned. All are sign or categorical errors, so they hold
+    on any ISA. The subnormal flush and the transcendental ULP gap are
+    deliberately left out: flush-to-zero is a property of the CPU kernels and the
+    ULP gap is rounding, so both could legitimately differ between x86 and
+    aarch64, exactly like the numpy and torch cases in the module docstring.
+    """
+    tf = pytest.importorskip("tensorflow")
+    refs, known = _known_refs(backends.tf_backend(tf))
+    assert known, "the tensorflow sweep found nothing, so it is not actually running"
+    assert refs[ref] > 0, (
+        f"nothing is still attributed to {ref} ({what}); if TensorFlow fixed it, "
+        "remove that entry from known.py and update the README"
+    )
+
+
+@pytest.mark.parametrize(
     "op, dtype",
     [(op, dt) for op in ("minimum", "maximum") for dt in ("float32", "float64")],
 )

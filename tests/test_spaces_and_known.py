@@ -108,6 +108,18 @@ class TestKnownSuppression:
         new, seen = partition([_finding(check="ulp", op="cos", dtype="float64")], known)
         assert len(new) == 1
 
+    def test_an_entry_can_name_several_checks_but_no_others(self):
+        """One cause often surfaces through more than one check: a flush to zero
+        is reported by `numpy-semantics` against the oracle and by
+        `size-invariance` against the library itself. An entry may name both,
+        and must not thereby cover a third check it did not name."""
+        known = [Known(("ulp", "size-invariance"), "cos", "reason", "ref")]
+        for check in ("ulp", "size-invariance"):
+            new, seen = partition([_finding(check=check, op="cos")], known)
+            assert len(seen) == 1, f"{check} was named and should be covered"
+        new, seen = partition([_finding(check="layout-invariance", op="cos")], known)
+        assert len(new) == 1, "an unnamed check must still be reported"
+
     def test_a_predicate_narrows_an_entry_to_part_of_the_input_range(self):
         """`when` exists so that suppressing a documented underflow in exp does
         not also suppress every other accuracy bug in exp."""
@@ -191,10 +203,21 @@ class TestKnownSuppression:
             assert "193781" in seen[0][1].ref
 
     def test_every_entry_carries_a_reason_and_a_link(self):
-        """An unexplained suppression is how a real bug gets buried."""
+        """An unexplained suppression is how a real bug gets buried.
+
+        A ref is either a link to the upstream thread that settled it, or the
+        string `recorded: ...` for a divergence nothing has been filed about. The
+        second form is the weaker one, so it has to say in the reason that it is
+        recorded rather than filed; otherwise "recorded:" becomes a way to
+        suppress anything without a paper trail.
+        """
         from arraydiff.known import KNOWN
 
         for name, entries in KNOWN.items():
             for k in entries:
                 assert len(k.reason) > 30, (name, k)
-                assert k.ref.startswith("https://"), (name, k)
+                if k.ref.startswith("recorded: "):
+                    assert len(k.ref) > len("recorded: ") + 10, (name, k)
+                    assert "recorded" in k.reason.lower(), (name, k)
+                else:
+                    assert k.ref.startswith("https://"), (name, k)

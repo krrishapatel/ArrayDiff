@@ -56,10 +56,18 @@ NUMPY_SIGN_BLIND_FLOATS = tuple(f for f in FLOATS if f not in NUMPY_SIGN_AWARE_F
 
 @dataclass(frozen=True)
 class Known:
-    check: str
+    # One check name, or a tuple of them when the same cause surfaces through
+    # several checks. A flush to zero, for instance, is reported by
+    # numpy-semantics against the oracle and by size-invariance against the
+    # library itself, and splitting that into two entries would duplicate the
+    # reason and let the copies drift apart.
+    check: str | tuple[str, ...]
     # One op name, or a tuple of them when a single root cause covers a family.
     op: str | tuple[str, ...]
     reason: str
+    # A link to the upstream thread that settled this, or `recorded: <what>` when
+    # nothing has been filed. The second form is deliberately clumsy to write, so
+    # that "nobody has looked at this" never reads like "someone ruled on it".
     ref: str
     # None means "every dtype". A tuple restricts to those dtypes, which matters
     # when the same check fires on ints and floats for unrelated reasons.
@@ -71,10 +79,11 @@ class Known:
     when: Callable[[object], bool] | None = None
 
     def matches(self, finding) -> bool:
+        checks = (self.check,) if isinstance(self.check, str) else self.check
         ops = (self.op,) if isinstance(self.op, str) else self.op
         dtypes = (self.dtype,) if isinstance(self.dtype, str) else self.dtype
         return (
-            self.check == finding.check
+            finding.check in checks
             and finding.op in ops
             and (dtypes is None or finding.dtype in dtypes)
             and (self.when is None or self.when(finding))
@@ -570,9 +579,202 @@ JAX_KNOWN = [
 ]
 
 
+def _tf_input_is_subnormal(finding) -> bool:
+    """True when a finding's input is a nonzero subnormal in its own dtype.
+
+    TensorFlow's CPU kernels flush subnormals to zero, so a divergence on a
+    subnormal input is that flush rather than a separate bug. Scoped this tightly
+    on purpose: minimum, maximum and floor_divide have their own zero-sign and
+    infinity bugs on ordinary inputs, and a blanket suppression would hide them.
+    """
+    name = "float32" if finding.dtype == "bfloat16" else finding.dtype
+    try:
+        tiny = float(np.finfo(getattr(np, name)).smallest_normal)
+    except (AttributeError, ValueError):
+        return False
+    return any(v == v and v != 0.0 and abs(v) < tiny for v in finding.inputs)
+
+
+# TensorFlow, on CPU. Nothing is filed against it, in line with the rest of this
+# file, so the refs describe the cause and point at the same bug in the libraries
+# where it is filed. Confirmed to persist with TF_ENABLE_ONEDNN_OPTS=0, so it is
+# the CPU kernels themselves, not oneDNN.
+_TF_FLUSH = (
+    "TensorFlow flushes subnormals to zero in its CPU kernels: ceil of the "
+    "smallest subnormal is 0.0 rather than 1.0, and add(x, x) on it is 0.0. Same "
+    "class as XLA's flush in JAX above; persists with TF_ENABLE_ONEDNN_OPTS=0, so "
+    "it is the kernels, not oneDNN. Recorded rather than filed."
+)
+_TF_FLUSH_REF = "recorded: tensorflow CPU flushes subnormals to zero"
+_TF_TRANSC = (
+    "About 1 ULP between a short array and a long one. TensorFlow's transcendental "
+    "kernels vectorize over length, so a length-1 or length-3 array takes the "
+    "scalar path and rounds a bit differently from the vectorized body. These ops "
+    "are not correctly rounded in any library, so this is allowed, the same as the "
+    "size-invariance entries for torch and jax above. Recorded because it is not a "
+    "defect, rather than filed."
+)
+_TF_TRANSC_REF = "recorded: tensorflow vectorized-vs-scalar transcendental rounding"
+
+TF_KNOWN: list[Known] = [
+    # Subnormal flush, on whichever ops happen to see a subnormal input. The
+    # predicate keeps this from swallowing the sign and infinity bugs below.
+    Known(
+        check="numpy-semantics",
+        op=("add", "subtract", "multiply", "divide", "floor", "ceil", "sign",
+            "minimum", "maximum"),
+        dtype=FLOATS,
+        when=_tf_input_is_subnormal,
+        reason=_TF_FLUSH,
+        ref=_TF_FLUSH_REF,
+    ),
+    Known(
+        check="size-invariance",
+        op="sign",
+        dtype=FLOATS,
+        reason=(
+            _TF_FLUSH + " Here it shows as length dependence: the scalar residual "
+            "keeps a subnormal that the vectorized body flushed, so sign disagrees "
+            "with itself across lengths."
+        ),
+        ref=_TF_FLUSH_REF,
+    ),
+    # reciprocal's findings are all the flush on the output: the reciprocal of a
+    # near-max input is subnormal and comes back as 0.0.
+    Known(
+        check=("numpy-semantics", "ulp", "size-invariance"),
+        op="reciprocal",
+        dtype=FLOATS,
+        reason=(
+            _TF_FLUSH + " Here the flush is on the output: the reciprocal of a "
+            "near-max value is subnormal, so it returns 0.0 (numpy-semantics/ulp) "
+            "and disagrees across lengths (size-invariance)."
+        ),
+        ref=_TF_FLUSH_REF,
+    ),
+    # minimum/maximum give a zero the wrong IEEE sign. Same bug as pytorch#193781
+    # and mlx. Where numpy can be trusted for a zero's sign the disagreement is
+    # TensorFlow's; on the sign-blind dtypes it is numpy's, exactly as for torch.
+    Known(
+        check="numpy-semantics",
+        op=("minimum", "maximum"),
+        dtype=NUMPY_SIGN_AWARE_FLOATS,
+        reason=(
+            "minimum(0.0, -0.0) is +0.0 and maximum(-0.0, 0.0) is -0.0, the "
+            "opposite of the IEEE result, which numpy gives correctly on these "
+            "dtypes. Same bug as pytorch#193781 in a fourth library. Recorded "
+            "rather than filed."
+        ),
+        ref="recorded: tensorflow min/max give a zero the wrong sign",
+    ),
+    # The same zero-sign bug reached through the check that needs no oracle, so
+    # it covers float16 too, where numpy is no use as a reference. This is where
+    # the cause is visible: the vectorized body returns the IEEE sign and the
+    # scalar tail does not, so max(-0.0, 0.0) is +0.0 in a length-503 array and
+    # -0.0 in a length-1 one. A separate entry from the one above because the
+    # dtype scope is genuinely different, not because the wording is.
+    Known(
+        check="size-invariance",
+        op=("minimum", "maximum"),
+        dtype=FLOATS,
+        reason=(
+            "TensorFlow contradicts itself on the sign of a zero across lengths: "
+            "the vectorized kernel picks the IEEE sign and the scalar tail returns "
+            "one operand regardless. No oracle is needed for this one, so it holds "
+            "on float16 as well. Some elements are the subnormal flush instead. "
+            "Recorded rather than filed."
+        ),
+        ref="recorded: tensorflow min/max give a zero the wrong sign",
+    ),
+    Known(
+        check="numpy-semantics",
+        op=("minimum", "maximum"),
+        dtype=NUMPY_SIGN_BLIND_FLOATS,
+        reason=(
+            "On the dtypes where numpy's own min/max are not sign-aware, a zero-"
+            "sign disagreement is numpy's, not TensorFlow's, so it says nothing "
+            "about the library under test. Same split as the torch entry above."
+        ),
+        ref="https://numpy.org/doc/stable/reference/generated/numpy.minimum.html",
+    ),
+    # floor_divide at infinity: 1.0 // -inf is -0.0 where numpy and Python give
+    # -1.0. Same bug as mlx#4317 and torch, now in TensorFlow.
+    Known(
+        check="numpy-semantics",
+        op="floor_divide",
+        dtype=FLOATS,
+        reason=(
+            "1.0 // -inf is -0.0 where numpy and Python give -1.0: floor(a / b) "
+            "is not what // means once an operand is infinite. Same bug as "
+            "mlx#4317 and the torch device split. Recorded rather than filed."
+        ),
+        ref="recorded: tensorflow floor_divide at infinity",
+    ),
+    # remainder gives a zero result the wrong sign. Same class as jax#40028,
+    # torch#193755, mlx#4315.
+    Known(
+        check=("numpy-semantics", "size-invariance"),
+        op="remainder",
+        dtype=FLOATS,
+        reason=(
+            "remainder(0.0, -1.0) is +0.0 where the contract is the sign of the "
+            "divisor, -0.0, which numpy and Python both give. The zero case is "
+            "not sign-corrected. Same bug as jax#40028, torch#193755 and "
+            "mlx#4315, found by one check in a fourth library. Recorded rather "
+            "than filed."
+        ),
+        ref="recorded: tensorflow remainder zero-sign",
+    ),
+    # divmod here is floordiv and floormod called together, so a divmod-identity
+    # finding is those two TF ops disagreeing with each other. Two causes, and
+    # they need separate entries because one is the flush and one is not.
+    Known(
+        check="divmod-identity",
+        op="divmod",
+        dtype=FLOATS,
+        when=_tf_input_is_subnormal,
+        reason=(
+            _TF_FLUSH + " A subnormal divisor acts as zero, so the quotient is inf "
+            "and q*b + r cannot recover the dividend. Same as the jax entry above."
+        ),
+        ref=_TF_FLUSH_REF,
+    ),
+    Known(
+        check="divmod-identity",
+        op="divmod",
+        dtype=FLOATS,
+        reason=(
+            "floordiv is floor(a / b), a division whose own rounding can carry the "
+            "result up past the floor, and floormod does not follow it there: in "
+            "bfloat16 2144 / 358 is 5.9888, which rounds to exactly 6.0, so "
+            "floordiv gives 6 while floormod gives 354, the remainder for 5. The "
+            "two ops are inconsistent, and composing divmod from them is what "
+            "surfaces it. This is the same defect as mlx#4003, which was closed on "
+            "the grounds that widening the division costs performance and that "
+            "PyTorch rounds the same way, so it is recorded as ruled-on rather "
+            "than filed a fourth time."
+        ),
+        ref="https://github.com/ml-explore/mlx/pull/4003",
+    ),
+    # Vectorized-vs-scalar rounding on the transcendentals, about 1 ULP, allowed.
+    Known(
+        check="size-invariance",
+        op=("arctan", "arctan2", "cos", "sin", "tanh", "exp", "expm1",
+            "log", "log1p", "power", "erf", "rsqrt"),
+        dtype=FLOATS,
+        reason=_TF_TRANSC,
+        ref=_TF_TRANSC_REF,
+    ),
+]
+
 # Each library gets its own list. A shared list would let an MLX ruling suppress
 # a real torch bug that happens to be the same op and dtype.
-KNOWN = {"mlx": MLX_KNOWN, "torch": TORCH_KNOWN, "jax": JAX_KNOWN}
+KNOWN = {
+    "mlx": MLX_KNOWN,
+    "torch": TORCH_KNOWN,
+    "jax": JAX_KNOWN,
+    "tensorflow": TF_KNOWN,
+}
 
 
 def known_for(backend_name):

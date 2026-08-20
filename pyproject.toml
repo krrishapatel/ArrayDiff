@@ -31,8 +31,10 @@ packages = ["arraydiff"]
 select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
-# The sweep tests need real torch/jax builds and run in their own CI job. The
-# fast unit-test job selects "not sweep" so it stays numpy-only and quick.
+# The sweep tests need real torch/jax/tensorflow builds and run in their own CI
+# job. The fast unit-test job selects "not sweep" so it stays numpy-only and
+# quick. Each sweep test importorskips its own library, so a partial install
+# skips rather than fails.
 markers = [
-    "sweep: runs the real differential sweep against installed torch/jax",
+    "sweep: runs the real differential sweep against the installed libraries",
 ]

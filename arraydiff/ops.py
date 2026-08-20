@@ -138,6 +138,35 @@ def build_torch_ops(torch):
     return _build(torch, TORCH_NAMES)
 
 
+def build_tf_ops(tf):
+    """TensorFlow. The ops live under `tf.math` with NumPy's names except for a
+    handful, so they are gathered the same way JAX's are.
+
+    Three ops are left out on purpose rather than mapped to something close.
+    `logaddexp` has no TF equivalent, and `logical_not` takes a bool tensor in TF
+    rather than acting on a float the way NumPy does, so mapping it would test a
+    different op. Both are dropped by simply not adding them, and the runner tests
+    TF on the ops it really has instead of inventing coverage.
+    """
+    m = tf.math
+    tf_names = {
+        "arctan": "atan",
+        "arctan2": "atan2",
+        "power": "pow",
+        "remainder": "floormod",
+        "floor_divide": "floordiv",
+    }
+    ns = SimpleNamespace()
+    for s in SPECS:
+        if s.name in ("logaddexp", "logical_not"):
+            continue
+        attr = tf_names.get(s.name, s.name)
+        fn = getattr(m, attr, None)
+        if fn is not None:
+            setattr(ns, s.name, fn)
+    return _build(ns, {})
+
+
 def build_jax_ops(jax):
     """jnp uses NumPy's spelling for almost everything.
 

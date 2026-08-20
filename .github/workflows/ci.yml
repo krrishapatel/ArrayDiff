@@ -58,4 +58,6 @@ jobs:
       # purpose.
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: pip install "jax[cpu]"
+      # tensorflow-cpu rather than tensorflow: same kernels, no CUDA payload.
+      - run: pip install tensorflow-cpu
       - run: pytest -q -m sweep

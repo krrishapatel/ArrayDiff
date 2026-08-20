@@ -38,8 +38,8 @@ class Backend:
     layouts: tuple[str, ...] | None = None
     # Devices to cross-check, most trusted first. Fewer than two means there is
     # nothing to compare and `device-invariance` skips. MLX has one unified
-    # device, and JAX here is CPU only, so torch is currently the only backend
-    # with a second entry.
+    # device, and JAX and TensorFlow here are CPU only, so torch is currently the
+    # only backend with a second entry.
     devices: tuple[str, ...] = ()
     to_device: Callable | None = None  # (native array, device name) -> array
 
@@ -147,6 +147,58 @@ def jax_backend(jax) -> Backend:
         # JAX dispatches asynchronously, so without this a check could compare
         # results that have not been computed yet.
         evaluate=lambda *xs: jax.block_until_ready(list(xs)),
+        layouts=("contiguous",),
+    )
+
+
+def tf_backend(tf) -> Backend:
+    """TensorFlow, eager, on CPU.
+
+    Layout invariance does not apply, for the same reason it does not in JAX:
+    `tf.constant` materializes a fresh contiguous buffer, so a strided NumPy view
+    handed to it arrives contiguous and the check would compare a copy against
+    itself. Only `contiguous` is declared, which makes the check skip rather than
+    pass for free. Length still selects the kernel, so size invariance applies,
+    and a native slice of an eager tensor keeps the values without a recompile.
+
+    One device only here, so device invariance skips too. bfloat16 comes back
+    from `.numpy()` as an ml_dtypes scalar NumPy cannot compare through the rest
+    of the pipeline, so it is widened to float32, which holds every bfloat16
+    value exactly.
+    """
+    from .ops import build_tf_ops
+
+    dtypes = {
+        n: getattr(tf, n)
+        for n in (
+            "float16", "float32", "float64", "bfloat16",
+            "int8", "int16", "int32", "int64", "uint8", "uint32",
+        )
+        if hasattr(tf, n)
+    }
+
+    def array(v, dtype=None):
+        return tf.constant(np.asarray(v), dtype=dtype)
+
+    def to_numpy(a):
+        if a.dtype == tf.bfloat16:
+            a = tf.cast(a, tf.float32)
+        return np.asarray(a)
+
+    def divmod_(a, b):
+        # TF has no divmod. Composing it from floordiv and floormod is the check:
+        # if the quotient and the remainder disagree, that is the divmod-identity
+        # bug, same as the torch adapter below.
+        return tf.math.floordiv(a, b), tf.math.floormod(a, b)
+
+    return Backend(
+        name="tensorflow",
+        dtypes=dtypes,
+        array=array,
+        to_numpy=to_numpy,
+        broadcast_to=tf.broadcast_to,
+        ops=build_tf_ops(tf),
+        divmod=divmod_,
         layouts=("contiguous",),
     )
 

@@ -13,6 +13,7 @@ BACKENDS = {
     "mlx": ("mlx.core", "mlx_backend"),
     "torch": ("torch", "torch_backend"),
     "jax": ("jax", "jax_backend"),
+    "tensorflow": ("tensorflow", "tf_backend"),
     "numpy": ("numpy", None),
 }
 

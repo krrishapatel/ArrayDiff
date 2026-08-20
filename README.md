@@ -116,6 +116,13 @@ whose exact result is genuinely subnormal, a band about 37 wide out of the whole
 line. Below it, returning `0.0` is correct rather than a flush, and the measured
 error is already zero.
 
+An entry can name several checks, for the opposite reason: one cause often
+surfaces through more than one. A flush to zero is reported by `numpy-semantics`
+against the oracle and by `size-invariance` against the library itself, and
+splitting that into two entries duplicates the reason and lets the copies drift.
+Naming a check it did not name is still a miss, so the entry cannot widen past
+what it claims.
+
 ## Checks
 
 | check | needs an oracle | what it means |
@@ -157,12 +164,13 @@ PYTHONPATH=/path/to/mlx/python arraydiff --only tan power --check layout-invaria
 
 arraydiff --backend torch
 arraydiff --backend jax
+arraydiff --backend tensorflow
 ```
 
 Exit status is 1 when there are findings, so it can gate CI. This repo's own CI
-runs the sweep against real torch and jax builds on every push and asserts that
-the specific filed bugs below still reproduce, so the day one is fixed upstream
-the run goes red instead of the counts here going stale. It does not assert a
+runs the sweep against real torch, jax and tensorflow builds on every push and
+asserts that the specific bugs below still reproduce, so the day one is fixed
+upstream the run goes red instead of the counts here going stale. It does not assert a
 zero-new count, because that count is platform-dependent: NumPy runs its
 transcendental SIMD loops on contiguous data only, so on x86 a reversed view
 lands about 1 ULP away where aarch64 is bit-identical, and torch's CPU `sqrt` is
@@ -184,12 +192,12 @@ new, already_known = partition(run(be), known_for(be.name))
 
 ## Status
 
-Four libraries, three of them under test and NumPy mostly serving as the oracle.
+Five libraries, four of them under test and NumPy mostly serving as the oracle.
 `known.py` accounts for everything already settled, so the new count below is
 only the part that is not, and every line of it is attributed to a cause before
 it is called a finding.
 
-Nothing is being filed against MLX, PyTorch or JAX at the moment. Everything
+Nothing is being filed against MLX, PyTorch, JAX or TensorFlow at the moment. Everything
 already open there is waiting on a maintainer, and adding to that pile is not
 what makes any of it get read. The one recent exception is
 [numpy#32341](https://github.com/numpy/numpy/pull/32341), which went to a
@@ -468,6 +476,81 @@ found by one check, after MLX and torch. That is the argument for a differential
 tester over a per library test suite: the bug is in the shape of the algorithm, not
 in any one codebase.
 
+### TensorFlow
+
+Against tensorflow 2.21.0, eager, on CPU:
+
+```
+0 new findings
+
+130 already accounted for in known.py
+    65  recorded: tensorflow vectorized-vs-scalar transcendental rounding
+    31  recorded: tensorflow CPU flushes subnormals to zero
+    19  recorded: tensorflow min/max give a zero the wrong sign
+     9  recorded: tensorflow remainder zero-sign
+     3  recorded: tensorflow floor_divide at infinity
+     2  https://numpy.org/doc/stable/reference/generated/numpy.minimum.html
+     1  https://github.com/ml-explore/mlx/pull/4003
+```
+
+This is the fourth library, and the point of adding it was to find out whether
+the bug classes above are properties of these codebases or of the algorithms.
+They are properties of the algorithms. Three of the four classes filed elsewhere
+came straight back, on inputs nobody chose for them, with no new check code:
+
+| what | also filed as |
+|---|---|
+| `minimum(0.0, -0.0)` is `+0.0`, `maximum(-0.0, 0.0)` is `-0.0` | pytorch [#193781](https://github.com/pytorch/pytorch/issues/193781), MLX above |
+| `remainder(0.0, -1.0)` is `+0.0`, not the divisor's `-0.0` | jax [#40028](https://github.com/jax-ml/jax/issues/40028), pytorch [#193755](https://github.com/pytorch/pytorch/issues/193755), MLX [#4315](https://github.com/ml-explore/mlx/issues/4315) |
+| `1.0 // -inf` is `-0.0`, not `-1.0` | MLX [#4317](https://github.com/ml-explore/mlx/issues/4317), pytorch MPS above |
+| `floordiv` rounds up past its own floor and `floormod` does not follow | MLX [#4003](https://github.com/ml-explore/mlx/pull/4003) |
+
+The last of those is the same arithmetic in the same dtype as the MLX entry:
+`floordiv(2144.0, 358.0)` in bfloat16 gives `6` because `5.9888` rounds to
+exactly `6.0`, while `floormod` gives `354`, the remainder for `5`. TensorFlow has
+no `divmod`, so the adapter calls both ops and compares them, which is what makes
+the inconsistency between the two visible at all. That was closed upstream in MLX
+on performance grounds, so it is recorded as ruled-on rather than filed a fourth
+time.
+
+The `min`/`max` case is the one that shows why `size-invariance` is worth having
+as a separate check. On float16 NumPy is not a usable oracle for a zero's sign, so
+`numpy-semantics` has to stay quiet there. `size-invariance` does not need an
+oracle, and TensorFlow contradicts itself: `maximum(-0.0, 0.0)` is `+0.0` in a
+length-503 array and `-0.0` in a length-1 one. The vectorized kernel is the one
+that gets IEEE right and the scalar tail is the one that does not, the same
+split as MLX's `base_simd.h` and torch's `std::min`, in a third unrelated
+codebase.
+
+The 31 are one root cause: **TensorFlow's CPU kernels flush subnormals to zero.**
+`tf.math.ceil` of the smallest float32 subnormal is `0.0` rather than `1.0`, and
+`add(x, x)` on it is `0.0`. This survives `TF_ENABLE_ONEDNN_OPTS=0`, so it is the
+kernels themselves rather than oneDNN dispatch. Same class as XLA's flush in JAX,
+which is documented and was closed as expected twice, and it is recorded on the
+same reasoning. It is scoped by a `when` predicate to inputs that are genuinely
+subnormal in their own dtype, because a blanket suppression on those ops would
+have swallowed the zero-sign and infinity bugs above, which happen on ordinary
+inputs.
+
+The 65 are about 1 ULP between a short array and a long one on the
+transcendentals. Not a defect: no library rounds those correctly, and it is the
+same allowance the torch and jax sections make.
+
+Two things had to be scoped rather than tested, and both are recorded in the
+adapter rather than left to look like passes. `tf.constant` materializes a fresh
+contiguous buffer, so a strided NumPy view arrives contiguous and
+`layout-invariance` would be comparing a copy against itself, exactly as in JAX;
+the adapter declares only `contiguous` so the check skips. And there is one device
+here, so `device-invariance` skips too. `logaddexp` has no TensorFlow equivalent
+and `logical_not` takes a bool tensor rather than acting on a float, so both are
+left out of the op table instead of being mapped to something close, which would
+have tested a different op and reported coverage that does not exist.
+
+Only the three sign and infinity classes are pinned in CI. The subnormal flush is
+a property of the CPU kernels and the ULP gap is rounding, so either could
+legitimately differ between x86 and aarch64, which is the same reasoning that
+keeps the zero-new count out of the CI assertions.
+
 ### NumPy
 
 NumPy is also wired up as a backend, and the sweep against it has to come back
@@ -517,3 +600,10 @@ has no negative strides, so `reversed` cannot be built there and comparing a cop
 against itself would have been a silently vacuous check, and `TORCH_NAMES` maps
 `equal` to `torch.eq` because `torch.equal` reduces a whole tensor to one bool,
 which would have made every comparison check pass for free.
+
+TensorFlow, the fourth, needed no change to `checks.py` at all, which is the
+result the contract is for. Its adapter is 30 lines and its op table is a name
+map, and the ops it does not have are left out rather than mapped to something
+close. The only thing it changed was `known.py`, which learned to let one entry
+name several checks, because a single TensorFlow cause was being reported through
+two of them.
