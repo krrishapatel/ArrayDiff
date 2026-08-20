@@ -125,6 +125,33 @@ MLX_KNOWN = [
         ),
         ref="https://github.com/ml-explore/mlx/issues/4317",
     ),
+    # A zero remainder keeps whatever sign its code path produced, so all three
+    # oracle-free axes see it at once, the same shape as #193781 in torch. This
+    # entry exists because the ruling went the other way, not because the
+    # behaviour changed: the fix was declined, so it is now a settled decision and
+    # reporting it again is what this file is for preventing.
+    *[
+        Known(
+            check=check,
+            op="remainder",
+            dtype=FLOATS,
+            reason=(
+                "The floored fixup is guarded on the remainder being nonzero, so "
+                "a zero never gets sign-corrected and keeps whatever the path "
+                "produced. Lane 8 of a length-9 array disagrees with lanes 0 to 7 "
+                "on identical inputs, and NumPy and Python both give the divisor's "
+                "sign. Filed as #4315 with a fix across all four backends in "
+                "#4316, and closed as won't fix: the maintainer's position is that "
+                "a fix which adds complexity is only warranted where MLX diverges "
+                "from other frameworks, and this reproduces in PyTorch and JAX too. "
+                "Worth noting which way that cuts, since the recurrence across "
+                "libraries is the argument this tool makes for the bug mattering "
+                "and the argument the maintainer made for leaving it alone."
+            ),
+            ref="https://github.com/ml-explore/mlx/issues/4315",
+        )
+        for check in ("layout-invariance", "size-invariance", "numpy-semantics")
+    ],
     Known(
         check="divmod-identity",
         op="divmod",
@@ -368,8 +395,8 @@ TORCH_KNOWN = [
                 "scalar path is std::min, which returns b < a ? b : a and so "
                 "ignores the sign of a zero, and the NEON path is vminq_f32, "
                 "which is sign-aware. minimum(0.0, -0.0) is therefore -0.0 in a "
-                "long tensor and 0.0 in a short one. Filed as #193781, fixed in "
-                "PR #193851."
+                "long tensor and 0.0 in a short one. Filed as #193781, with a "
+                "fix proposed in PR #193851, still open and unmerged."
             ),
             ref="https://github.com/pytorch/pytorch/issues/193781",
         )

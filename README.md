@@ -197,15 +197,24 @@ Five libraries, four of them under test and NumPy mostly serving as the oracle.
 only the part that is not, and every line of it is attributed to a cause before
 it is called a finding.
 
-Nothing is being filed against MLX, PyTorch, JAX or TensorFlow at the moment. Everything
-already open there is waiting on a maintainer, and adding to that pile is not
-what makes any of it get read. The one recent exception is
-[numpy#32341](https://github.com/numpy/numpy/pull/32341), which went to a
-project with nothing else outstanding.
+Nothing is being filed against MLX, PyTorch, JAX or TensorFlow. Everything already
+open there is waiting on a maintainer, and adding to that pile is not what makes
+any of it get read. TensorFlow is the newest library here and has nothing filed
+against it at all, deliberately.
+
+Of what was filed, two are settled and neither went the way the report argued.
+MLX declined the `remainder` fix on the grounds described below. The numpy fix,
+[#32341](https://github.com/numpy/numpy/pull/32341), was withdrawn: it went in as
+a PR when the project asks for an issue and a discussion first, and it did not
+disclose that it was written with AI assistance, which that project's template
+asks for. Both of those are on me rather than on the review. The remaining
+threads, including the `minimum`/`maximum` fix in
+[pytorch#193851](https://github.com/pytorch/pytorch/pull/193851), are open and
+unmerged.
 
 ### MLX
 
-Against MLX main at `c2bcf47`, with the pending `remainder` fix below applied:
+Against MLX main at `c2bcf47`, unpatched, which is what a user actually gets:
 
 ```
 42 new findings
@@ -213,8 +222,9 @@ Against MLX main at `c2bcf47`, with the pending `remainder` fix below applied:
     16  size-invariance
      2  numpy-semantics
 
-228 already accounted for in known.py
+252 already accounted for in known.py
    196  https://github.com/ml-explore/mlx/issues/4163
+    24  https://github.com/ml-explore/mlx/issues/4315
     14  https://github.com/ml-explore/mlx/issues/4162
      8  https://github.com/ml-explore/mlx/issues/4119
      3  https://github.com/ml-explore/mlx/issues/4317
@@ -223,7 +233,14 @@ Against MLX main at `c2bcf47`, with the pending `remainder` fix below applied:
      1  https://github.com/ml-explore/mlx/pull/4003
 ```
 
-The 228 are the main evidence that the checks work: the tool rediscovers the
+An earlier version of this section reported 42 new and 228 known measured with the
+`remainder` fix below applied, when that fix was still open. It has since been
+declined, so the patched build is not a thing anyone runs and the numbers are now
+taken against plain main. The new count is unchanged at 42, because the 24
+findings the patch removed are the `remainder` bug, and a declined fix means they
+belong in `known.py` as a settled decision rather than in the new column.
+
+The 252 are the main evidence that the checks work: the tool rediscovers the
 whole known numerical bug cluster without being told about any of it.
 
 All 42 new findings are one bug, and the special-value pairing change above is
@@ -263,12 +280,20 @@ Two bugs were filed out of earlier runs, and one rediscovery is recorded.
 reduces to a self contradiction: lane 8 of
 `mx.remainder(mx.full((9,), -0.0), mx.full((9,), 3.0))` disagrees with lanes 0 to
 7 on identical inputs, because the Accelerate SIMD body and the scalar residual
-produce zeros of different signs and the floored fixup skips zero. Filed as
+produce zeros of different signs and the floored fixup skips zero. Length 7 is
+`-0.0` in every lane, length 8 is `+0.0` in every lane, and length 9 is `+0.0` in
+the first eight and `-0.0` in the ninth. Filed as
 [#4315](https://github.com/ml-explore/mlx/issues/4315), with a fix across all
 four backends proposed in
-[#4316](https://github.com/ml-explore/mlx/pull/4316), still open. The numbers
-above are measured with that patch applied, which is why it has no entry in the
-list.
+[#4316](https://github.com/ml-explore/mlx/pull/4316).
+
+**Both were closed as won't fix**, and the reasoning is worth recording: a fix
+that adds complexity is only warranted where MLX diverges from other frameworks,
+and this reproduces in PyTorch and JAX too. That cuts against the argument this
+tool makes. The recurrence across libraries is the evidence here that a bug is in
+the shape of the algorithm rather than in one codebase, and it is also the reason
+given for leaving it alone. Recorded as ruled-on, which is what the 24 entries
+above are, rather than argued with.
 
 **`floor_divide` disagrees with both NumPy and Python at infinity.** `inf // -3.0`
 gives `-inf` where both references give `nan`, and `1.0 // -inf` gives `-0.0`
@@ -363,8 +388,9 @@ ignores the signs and returns whichever argument the expansion happens to name,
 while the vectorized kernel uses `vminq_f32` and is sign aware. So
 `torch.minimum` on `(-0.0, 0.0)` gives `-0.0` on a contiguous tensor and `0.0`
 through a stride, on the same values. Filed as
-[#193781](https://github.com/pytorch/pytorch/issues/193781) and fixed in
-[#193851](https://github.com/pytorch/pytorch/pull/193851), and it is the 46
+[#193781](https://github.com/pytorch/pytorch/issues/193781), with a fix proposed
+in [#193851](https://github.com/pytorch/pytorch/pull/193851), which is still open
+and unmerged. It is the 46
 entries above, spread over `layout-invariance`, `size-invariance` and
 `numpy-semantics` because all three axes can see it. MLX has the same bug from the
 same cause in its own scalar path, above; it was invisible to this tool in both
@@ -471,10 +497,15 @@ is `0.0` where Python and NumPy give `-0.0`. `_float_divmod` computes `x1 - mod`
 before dividing, and for a negative zero dividend that is `-0.0 - -0.0`, which is
 `+0.0`, so the sign is gone before the division happens.
 
-The zero remainder sign is now the third independent instance of one bug class
-found by one check, after MLX and torch. That is the argument for a differential
-tester over a per library test suite: the bug is in the shape of the algorithm, not
-in any one codebase.
+The zero remainder sign is the third independent instance of one bug class found
+by one check, after MLX and torch, and TensorFlow below makes four. That is the
+argument for a differential tester over a per library test suite: the bug is in
+the shape of the algorithm, not in any one codebase. It is worth being honest that
+the argument has been used against itself. MLX declined its half on the grounds
+that the behaviour is not a divergence, precisely because PyTorch and JAX do the
+same thing. Four libraries agreeing is either strong evidence that the algorithm
+is wrong or a working definition of the expected behaviour, and which one it is
+turns out to be a judgement the maintainers make, not the tool.
 
 ### TensorFlow
 
